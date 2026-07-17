@@ -124,12 +124,9 @@ def create_llm_client(
     if provider == "opencode":
         api_key = os.getenv("OPENCODE_GO_API_KEY", "")
         if not api_key:
-            # fallback: try loading from ~/.hermes/.env
-            from dotenv import load_dotenv as _ld
-            _ld(os.path.expanduser("~/.hermes/.env"))
-            api_key = os.getenv("OPENCODE_GO_API_KEY", "")
-        if not api_key:
-            raise ValueError("OPENCODE_GO_API_KEY 环境变量未设置，且 ~/.hermes/.env 中也未找到")
+            raise ValueError(
+                "OPENCODE_GO_API_KEY 环境变量未设置，请在项目 .env 文件中配置"
+            )
         url = base_url or "https://opencode.ai/zen/go/v1"
     elif provider == "deepseek":
         api_key = os.getenv("DEEPSEEK_API_KEY", "")

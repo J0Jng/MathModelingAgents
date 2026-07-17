@@ -114,7 +114,8 @@ Layer 3 的 Python 代码块会被**实际执行**（沙盒限制 30 秒 / 512MB
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `MATHMODELING_LLM_PROVIDER` | `opencode` | LLM 通道：`opencode` 或 `deepseek` |
-| `DEEPSEEK_API_KEY` | (必填) | DeepSeek 官方 API 密钥（降级通道用） |
+| `OPENCODE_GO_API_KEY` | (必填) | OpenCode Go API 密钥（主通道） |
+| `DEEPSEEK_API_KEY` | (必填) | DeepSeek 官方 API 密钥（降级通道） |
 | `MATHMODELING_MAX_DEBATE_ROUNDS` | `10` | 建模辩论最大轮数 |
 | `MATHMODELING_MAX_IMPL_RETRIES` | `3` | 代码实现最大重试次数 |
 | `MATHMODELING_DEFAULT_MAX_TOKENS` | `16384` | 单次 LLM 调用最大输出 |
