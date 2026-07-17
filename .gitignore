@@ -1,0 +1,24 @@
+# MathModelingAgents Git 忽略文件
+
+# 环境变量（含 API Key 等敏感信息）
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+*.egg-info/
+
+# 运行时输出
+results/
+cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
