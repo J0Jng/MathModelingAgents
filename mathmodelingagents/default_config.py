@@ -115,12 +115,19 @@ DEFAULT_CONFIG: dict = {
     # 生成参数
     # ═══════════════════════════════════════════════
     "default_max_tokens": int(_env("default_max_tokens", "16384")),
-    "default_temperature": float(_env("default_temperature", "0.0")),
+    "default_temperature": 0.2,  # 全局默认值，按角色覆盖见下
     "max_tokens_overrides": {
         # agent_name 或 role → max_tokens 覆盖（当前全部使用统一上限）
     },
     "temperature_overrides": {
-        # role → temperature 覆盖（无覆盖项）
+        # role → temperature 覆盖（优先级：agent_name > role > default）
+        # 原则：一致性高的用低温，需要辩论多样性的用中温
+        "manager": 0.1,         # 裁决需要稳定，同输入同输出
+        "coder": 0.0,           # 代码必须是确定性的
+        "algorithm": 0.1,       # 算法设计接近代码，稳定为主
+        "visualizer": 0.1,      # 图表生成需要一致
+        "architect": 0.3,       # 论文大纲可有些微调
+        "writer": 0.5,          # 正文需要表达多样性
     },
 
     # ═══════════════════════════════════════════════
