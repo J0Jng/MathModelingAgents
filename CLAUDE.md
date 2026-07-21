@@ -1,31 +1,58 @@
 # MathModelingAgents Project
 
-Multi-agent mathematical modeling framework using LangGraph. 5-layer architecture.
+Multi-agent mathematical modeling framework using LangGraph. 5-layer architecture with agentic tool calling.
 
 ## Architecture
-- Layer 1: Problem Analysis (Decomposer → DataAnalyst → ConstraintAnalyst → ProblemManager)
-- Layer 2: Mathematical Modeling (ModelerA → ModelerB → ModelerC → ModelingManager, debate loop)
-- Layer 3: Code Implementation (AlgorithmDesigner → Coder → Visualizer → ImplManager, retry loop)
-- Layer 4: Paper Writing (PaperArchitect → SectionWriter → ChartDesigner → PaperManager, revise loop)
-- Layer 5: Sensitivity Analysis (optional)
+- Layer 1: Problem Analysis (Decomposer → DataAnalyst → ConstraintAnalyst → ProblemManager, 4 agents)
+- Layer 2: Mathematical Modeling (ModelerA → ModelerB → ModelerC → ModelingManager, debate loop, 4 agents)
+- Layer 3: Code Implementation (CodingAgent → ImplManager, agentic tool-calling loop, 2 agents)
+- Layer 4: Paper Writing (PaperAgent → PaperManager, agentic section-by-section loop, 2 agents)
+- Layer 5: Sensitivity Analysis (optional, 3 agents)
+
+Total: 15 agents (down from 19 — Layer 3 and 4 merged from 3-agent chains into single tool-calling agents)
+
+## Layer 3 — CodingAgent
+- Single agent with real tools: run_code, read_file, write_file, list_dir
+- Internal loop (max 30 iterations): write code → execute → see output/errors → fix → re-execute
+- Self-check with SELF_CHECK_PASSED marker
+- ImplManager does external review only (no tools), issues RETRY with specific instructions
+
+## Layer 4 — PaperAgent
+- Single agent with read-only tools: read_file, list_dir, write_file (NO run_code)
+- Section-by-section loop: write §N → read_file verify facts against source data → fix → lock → next
+- Can go back to fix previous sections if inconsistencies discovered
+- Self-check with SELF_CHECK_PASSED marker
+- PaperManager does external review (no tools), issues REVISE with §-level specific feedback
+
+## Prompt Caching
+- All 15 system prompts are pure static strings (no f-string variable injection)
+- Dynamic values (output_dir, round_count, retry_count, etc.) moved to user messages
+- _build_context() now includes all runtime config in the "当前状态" section
+- Enables LLM API prefix caching for 100% system prompt cache hit rate per agent
+
+## Chinese Font Handling
+- Sandbox preamble auto-detects CJK fonts (SimHei > Microsoft YaHei > STSong > ...)
+- CodingAgent prompt requires checking font availability before using Chinese labels
+- Falls back to English labels if no CJK font detected (prevents tofu boxes)
 
 ## Key Files
 - `mathmodelingagents/default_config.py` — model routing, max_tokens, temperature config
-- `mathmodelingagents/agents/utils/prompt_templates.py` — all agent system prompts
+- `mathmodelingagents/agents/utils/prompt_templates.py` — all 15 static agent system prompts
 - `mathmodelingagents/llm_clients/__init__.py` — LLM client factory (OpenCode Go / DeepSeek)
+- `mathmodelingagents/agents/__init__.py` — agent node factory functions (incl. tool-calling loops)
+- `mathmodelingagents/tools/__init__.py` — sandbox code execution + LangChain tool wrappers
 - `mathmodelingagents/graph/setup.py` — StateGraph construction
-- `mathmodelingagents/agents/__init__.py` — agent node factory functions
 
 ## Known Model Issues
 - kimi-k2.7-code: returns empty on long Chinese math prompts → REMOVED from config (2026-07-17)
-- qwen3.7-max: returns empty on long Chinese math prompts → DO NOT USE
+- qwen3.7-max: returns empty on long Chinese math prompts (modeling scenarios) → OK for paper writing
 - glm-5.2/glm-5.1: returns empty on long Chinese math prompts → DO NOT USE
 - deepseek-v4-flash: works but lower quality for complex reasoning
 - deepseek-v4-pro: works well, deep reasoning, best for manager/agent/coder roles
 
 ## Config Rules
 - Max_tokens_overrides: agent_name priority > role > default (1024)
-- Temperature_overrides: role > default (0.0); all kimi models removed, no overrides needed
+- Temperature_overrides: role > default (0.0)
 - All layers timeout: 10800s (3 hours)
 - **Unified fallback chain** (`invoke_with_fallback` in `llm_clients/__init__.py`):
   1. Primary provider + role model (e.g. opencode + deepseek-v4-pro)
@@ -34,6 +61,12 @@ Multi-agent mathematical modeling framework using LangGraph. 5-layer architectur
   4. Fallback provider + flash model
   Each step: 3 retries with exponential backoff (2s → 4s → 8s) for transient errors
 - Empty-content detection: `_invoke_with_retry` treats responses < 10 chars as model failure → triggers retry/fallback
+
+## Sandbox Security
+- Blocked modules: socket, requests, urllib, http, ftplib, telnetlib, smtplib, poplib, imaplib, ctypes
+- Subprocess, os, threading, shutil allowed (needed by matplotlib/numpy/scipy internals)
+- Code executes as subprocess with temp directory isolation
+- All network and native code loading vectors blocked
 
 ## Standard
 - Python with type hints

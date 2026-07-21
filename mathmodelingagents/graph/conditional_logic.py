@@ -83,7 +83,7 @@ class ConditionalLogic:
             state: 当前全局 AgentState。
 
         Returns:
-            "modeler_a" 继续辩论，"algorithm_designer" 进入 Layer 3，
+            "modeler_a" 继续辩论，"coding_agent" 进入 Layer 3，
             或 END。
         """
         debate_state = state.get("model_debate_state") or state.get("debate_state", {})
@@ -99,7 +99,7 @@ class ConditionalLogic:
         logger.info(f"Layer 2 辩论结束 (decision={judge_decision}, round={round_count})")
 
         if 3 in self.selected_layers:
-            return "algorithm_designer"
+            return "coding_agent"
         return self._route_to_next_layer(3)
 
     # ═══════════════════════════════════════════════════════════════
@@ -115,7 +115,7 @@ class ConditionalLogic:
             state: 当前全局 AgentState。
 
         Returns:
-            "algorithm_designer" 重试，"paper_architect" 进入 Layer 4，
+            "coding_agent" 重试，"paper_agent" 进入 Layer 4，
             或 END。
         """
         error_analysis = state.get("error_analysis", "")
@@ -125,12 +125,12 @@ class ConditionalLogic:
             logger.info(
                 f"Layer 3 实现重试 (retry {retry_count + 1}/{self.max_impl_retries})"
             )
-            return "algorithm_designer"
+            return "coding_agent"
 
         logger.info(f"Layer 3 实现完成 (retries={retry_count})")
 
         if 4 in self.selected_layers:
-            return "paper_architect"
+            return "paper_agent"
         return self._route_to_next_layer(4)
 
     # ═══════════════════════════════════════════════════════════════
@@ -141,13 +141,13 @@ class ConditionalLogic:
         """PaperManager 后决定：退回修改 (REVISE) 还是进入下一层。
 
         读取 debate_state 中的 judge_decision 和 round_count，
-        REVISE 时退回 SectionWriter，CONCLUDE 时进入 clear_paper。
+        REVISE 时退回 PaperAgent，CONCLUDE 时进入 clear_paper。
 
         Args:
             state: 当前全局 AgentState。
 
         Returns:
-            "section_writer" 退回修改，或 "clear_paper" 进入下一层。
+            "paper_agent" 退回修改，或 "clear_paper" 进入下一层。
         """
         debate = state.get("model_debate_state") or state.get("debate_state") or {}
         judge_decision = debate.get("judge_decision", "CONCLUDE")
@@ -157,7 +157,7 @@ class ConditionalLogic:
             logger.info(
                 f"Layer 4 论文退回修改 (round {round_count}/{self.max_debate_rounds})"
             )
-            return "section_writer"
+            return "paper_agent"
 
         logger.info(f"Layer 4 论文通过 (decision={judge_decision}, round={round_count})")
         return "clear_paper"
@@ -203,8 +203,8 @@ class ConditionalLogic:
         """
         layer_entry_map: dict[int, str] = {
             2: "modeler_a",
-            3: "algorithm_designer",
-            4: "paper_architect",
+            3: "coding_agent",
+            4: "paper_agent",
             5: "sensitivity_scanner",
         }
 

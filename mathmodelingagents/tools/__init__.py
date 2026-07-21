@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import tempfile
 import time
@@ -61,14 +62,11 @@ def read_problem_file(path: str) -> str:
 
 # Modules that are ALWAYS blocked (security risk even if pre-loaded)
 _RISKY_MODULES = {
-    "os", "subprocess", "shutil", "socket", "requests", "urllib",
-    "http", "ftplib", "telnetlib", "smtplib", "poplib", "imaplib",
-    "multiprocessing", "threading", "ctypes", "signal",
-    "pty", "pipes", "fcntl", "grp", "pwd", "resource",
-    "syslog", "crypt", "spwd", "sched",
-    "email", "nntplib", "xmlrpc",
-    "asyncio", "concurrent",
-    "webbrowser",
+    # Network access — the primary security boundary
+    "socket", "requests", "urllib", "urllib2", "http", "httplib",
+    "ftplib", "telnetlib", "smtplib", "poplib", "imaplib",
+    # Native code execution
+    "ctypes",
 }
 
 
@@ -76,17 +74,24 @@ def run_code(
     code: str,
     timeout: int = 30,
     allowed_modules: list[str] | None = None,
+    cwd: str | None = None,
 ) -> dict[str, Any]:
     """Execute Python code in a sandboxed subprocess and return results.
 
-    The code runs in an isolated temporary directory. Dangerous modules
-    (os, subprocess, socket, etc.) are blocked via import hook.
+    The code runs in an isolated temporary directory by default. If *cwd* is
+    provided the script executes there instead, so files the code writes
+    (e.g. matplotlib charts) persist after the call.
+
+    Dangerous modules (os, subprocess, socket, etc.) are blocked via import
+    hook regardless of working directory.
 
     Args:
         code: Python source code to execute.
         timeout: Maximum execution time in seconds.
         allowed_modules: Extra modules to allow (data-science stack is always
             allowed). Defaults to numpy/scipy/pandas/matplotlib/sklearn/etc.
+        cwd: Optional working directory. When given, the script runs in this
+            directory and any files it creates survive the call.
 
     Returns:
         dict with keys:
@@ -120,68 +125,125 @@ def run_code(
         "        return _original_import(name, *args, **kwargs)",
         "    return _original_import(name, *args, **kwargs)",
         "builtins.__import__ = _safe_import",
+        "",
+        "# --- matplotlib Chinese font auto-config ---",
+        "_MM_CJK_FONT = None",
+        "try:",
+        "    import matplotlib",
+        "    import matplotlib.font_manager as _fm",
+        "    _cjk_keywords = ['hei', 'song', 'ming', 'kai', 'yuan', 'cjk', 'noto',",
+        "                     'wenquan', 'yahei', 'simsun', 'fangsong', 'chinese',",
+        "                     'han', 'jp', 'tc', 'sc', 'pming', 'lihei',",
+        "                     'stheiti', 'stsong', 'stkaiti', 'stfangsong', 'microsoft yahei']",
+        "    _cjk_fonts = [f for f in _fm.fontManager.ttflist",
+        "                  if any(kw in f.name.lower() for kw in _cjk_keywords)]",
+        "    if _cjk_fonts:",
+        "        # Prefer most common Chinese fonts",
+        "        _preferred = ['SimHei', 'Microsoft YaHei', 'STSong', 'KaiTi', 'FangSong',",
+        "                      'Noto Sans CJK', 'WenQuanYi', 'AR PL UMing']",
+        "        _chosen = None",
+        "        for _pref in _preferred:",
+        "            for _f in _cjk_fonts:",
+        "                if _pref.lower() in _f.name.lower():",
+        "                    _chosen = _f",
+        "                    break",
+        "            if _chosen:",
+        "                break",
+        "        if not _chosen:",
+        "            _chosen = _cjk_fonts[0]",
+        "        _MM_CJK_FONT = _chosen.name",
+        "        matplotlib.rcParams['font.sans-serif'] = [_MM_CJK_FONT, 'DejaVu Sans', 'Arial']",
+        "        matplotlib.rcParams['axes.unicode_minus'] = False",
+        "        print(f'[sandbox] 中文字体已激活: {_MM_CJK_FONT}', flush=True)",
+        "    else:",
+        "        print('[sandbox] ⚠️ 未检测到中文字体，图表中文可能显示为方块', flush=True)",
+        "except Exception as _e:",
+        "    print(f'[sandbox] ⚠️ 字体配置异常: {_e}', flush=True)",
         "# --- end preamble ---",
         "",
     ]
     sandboxed_code = "\n".join(preamble_lines) + "\n" + code
 
-    with tempfile.TemporaryDirectory(prefix="mm_sandbox_") as tmpdir:
-        script_path = Path(tmpdir) / "_exec.py"
-        script_path.write_text(sandboxed_code, encoding="utf-8")
+    # ── persistent vs temp working directory ──
+    if cwd:
+        work_dir = Path(cwd).resolve()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        _use_temp = False
+    else:
+        work_dir = None  # set inside context manager
+        _use_temp = True
 
-        start = time.perf_counter()
-        try:
-            proc = subprocess.run(
-                ["python3", str(script_path)],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=tmpdir,
-                env={
-                    "PATH": "/usr/bin:/usr/local/bin",
-                    "PYTHONPATH": tmpdir,
-                    "HOME": tmpdir,
-                },
-            )
-            elapsed = time.perf_counter() - start
+    if _use_temp:
+        with tempfile.TemporaryDirectory(prefix="mm_sandbox_") as tmpdir:
+            return _exec_script(sandboxed_code, tmpdir, timeout)
+    else:
+        return _exec_script(sandboxed_code, str(work_dir), timeout)
 
-            stdout = proc.stdout[:10000] if proc.stdout else ""
-            stderr = proc.stderr[:5000] if proc.stderr else ""
-            exit_code = proc.returncode
 
-            logger.info(
-                "run_code: exit=%d, time=%.2fs, stdout=%d chars, stderr=%d chars",
-                exit_code, elapsed, len(stdout), len(stderr),
-            )
+def _exec_script(sandboxed_code: str, work_dir: str, timeout: int) -> dict[str, Any]:
+    """Internal: write script to *work_dir* and execute it."""
+    import sys as _sys
+    script_path = Path(work_dir) / "_exec.py"
+    script_path.write_text(sandboxed_code, encoding="utf-8")
 
-            return {
-                "stdout": stdout,
-                "stderr": stderr,
-                "exit_code": exit_code,
-                "success": exit_code == 0,
-                "execution_time": round(elapsed, 3),
-            }
+    # Use sys.executable (current Python) rather than hardcoded 'python3'
+    # 'python3' doesn't exist on Windows
+    python_exe = _sys.executable
 
-        except subprocess.TimeoutExpired:
-            elapsed = time.perf_counter() - start
-            logger.warning("run_code: timed out after %.1fs", timeout)
-            return {
-                "stdout": "",
-                "stderr": f"[超时] 代码执行超过 {timeout} 秒",
-                "exit_code": -1,
-                "success": False,
-                "execution_time": round(elapsed, 3),
-            }
-        except Exception as e:
-            elapsed = time.perf_counter() - start
-            logger.exception("run_code: unexpected error")
-            return {
-                "stdout": "",
-                "stderr": f"[错误] 执行失败: {e}",
-                "exit_code": -1,
-                "success": False,
-                "execution_time": round(elapsed, 3),
-            }
+    start = time.perf_counter()
+    try:
+        # Inherit parent environment, only override working-directory vars
+        env = os.environ.copy()
+        env["PYTHONPATH"] = work_dir
+        env["HOME"] = work_dir
+
+        proc = subprocess.run(
+            [python_exe, str(script_path)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=work_dir,
+            env=env,
+        )
+        elapsed = time.perf_counter() - start
+
+        stdout = proc.stdout[:10000] if proc.stdout else ""
+        stderr = proc.stderr[:5000] if proc.stderr else ""
+        exit_code = proc.returncode
+
+        logger.info(
+            "run_code: exit=%d, time=%.2fs, stdout=%d chars, stderr=%d chars, cwd=%s",
+            exit_code, elapsed, len(stdout), len(stderr), work_dir,
+        )
+
+        return {
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": exit_code,
+            "success": exit_code == 0,
+            "execution_time": round(elapsed, 3),
+        }
+
+    except subprocess.TimeoutExpired:
+        elapsed = time.perf_counter() - start
+        logger.warning("run_code: timed out after %.1fs", timeout)
+        return {
+            "stdout": "",
+            "stderr": f"[超时] 代码执行超过 {timeout} 秒",
+            "exit_code": -1,
+            "success": False,
+            "execution_time": round(elapsed, 3),
+        }
+    except Exception as e:
+        elapsed = time.perf_counter() - start
+        logger.exception("run_code: unexpected error")
+        return {
+            "stdout": "",
+            "stderr": f"[错误] 执行失败: {e}",
+            "exit_code": -1,
+            "success": False,
+            "execution_time": round(elapsed, 3),
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -259,20 +321,21 @@ def create_langchain_tools() -> list:
         )
 
     @tool
-    def read_problem_file_tool(path: str) -> str:
-        """Read the problem description file at the given path."""
+    def read_file_tool(path: str) -> str:
+        """Read a file at the given path. Returns its contents as a string."""
         return read_problem_file(path)
 
     @tool
     def run_code_tool(
         code: str,
         timeout: int = 30,
-    ) -> dict:
+    ) -> str:
         """Execute Python code in a sandboxed subprocess.
 
-        Returns dict with stdout, stderr, exit_code, success, execution_time.
+        Returns a JSON string with keys: stdout, stderr, exit_code, success, execution_time.
         """
-        return run_code(code, timeout=timeout)
+        result = run_code(code, timeout=timeout)
+        return json.dumps(result, ensure_ascii=False)
 
     @tool
     def web_search_tool(query: str) -> str:
@@ -280,20 +343,206 @@ def create_langchain_tools() -> list:
         return web_search(query)
 
     @tool
-    def save_result_tool(
-        data: str,
-        filename: str,
-        output_dir: str = "./results",
+    def write_file_tool(
+        content: str,
+        path: str,
     ) -> str:
-        """Save result string to a file under output_dir."""
-        return save_result(data, filename, output_dir=output_dir)
+        """Write content to a file at the given path.
+
+        Parent directories are created if needed. Returns the absolute path
+        on success or an error message on failure.
+        """
+        p = Path(path).expanduser().resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            p.write_text(content, encoding="utf-8")
+            logger.info("write_file_tool: wrote %d chars to %s", len(content), p)
+            return f"文件已写入: {p} ({len(content)} 字符)"
+        except Exception as e:
+            logger.exception("write_file_tool failed for %s", p)
+            return f"[错误] 写入失败: {e}"
 
     return [
-        read_problem_file_tool,
+        read_file_tool,
         run_code_tool,
         web_search_tool,
-        save_result_tool,
+        write_file_tool,
     ]
+
+
+def create_coding_agent_tools(output_dir: str) -> list:
+    """Create LangChain tools scoped to *output_dir* (for CodingAgent).
+
+    These tools are identical to create_langchain_tools() except that
+    run_code_tool runs in a persistent working directory so files like
+    matplotlib charts survive across calls.
+
+    Args:
+        output_dir: Root output directory. Code runs in output_dir/code/,
+            results are saved under output_dir/results/.
+
+    Returns:
+        List of LangChain BaseTool instances.
+    """
+    try:
+        from langchain_core.tools import tool
+    except ImportError:
+        raise ImportError(
+            "langchain_core is required to create LangChain tools. "
+            "Install with: pip install langchain-core"
+        )
+
+    work_dir = str(Path(output_dir).resolve() / "code")
+    results_dir = str(Path(output_dir).resolve() / "results")
+    Path(work_dir).mkdir(parents=True, exist_ok=True)
+    Path(results_dir).mkdir(parents=True, exist_ok=True)
+
+    @tool
+    def read_file_tool(path: str) -> str:
+        """Read a file at the given path. Returns its contents as a string.
+
+        Use this to read data files, Layer 2 model output, or code you've
+        previously saved.
+        """
+        return read_problem_file(path)
+
+    @tool
+    def run_code_tool(
+        code: str,
+        timeout: int = 60,
+    ) -> str:
+        """Execute Python code in a sandbox and return a JSON result.
+
+        The code runs in a persistent working directory — files created by
+        matplotlib (plt.savefig) or other libraries survive and can be used
+        later. To save charts: plt.savefig('../results/chart_name.png').
+
+        Returns JSON with keys: stdout, stderr, exit_code, success, execution_time.
+        A non-zero exit_code means the code failed — read stderr to debug.
+        """
+        result = run_code(code, timeout=timeout, cwd=work_dir)
+        return json.dumps(result, ensure_ascii=False)
+
+    @tool
+    def write_file_tool(
+        content: str,
+        path: str,
+    ) -> str:
+        """Write content to a file. Parent directories are created as needed.
+
+        Use this to save final Python scripts, JSON results, or other
+        artifacts you want to keep.
+        """
+        p = Path(path).expanduser().resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            p.write_text(content, encoding="utf-8")
+            logger.info("write_file_tool: wrote %d chars to %s", len(content), p)
+            return f"文件已写入: {p} ({len(content)} 字符)"
+        except Exception as e:
+            logger.exception("write_file_tool failed for %s", p)
+            return f"[错误] 写入失败: {e}"
+
+    @tool
+    def list_dir_tool(
+        path: str = ".",
+    ) -> str:
+        """List files in a directory. Returns a newline-separated list.
+
+        Use this to check what files exist in the code or results directories
+        before reading them or to verify files were created.
+        """
+        p = Path(path).expanduser().resolve()
+        if not p.exists():
+            return f"[错误] 目录不存在: {p}"
+        if not p.is_dir():
+            return f"[错误] 不是目录: {p}"
+        try:
+            entries = []
+            for entry in sorted(p.iterdir()):
+                suffix = "/" if entry.is_dir() else ""
+                size = f" ({entry.stat().st_size:,} bytes)" if entry.is_file() else ""
+                entries.append(f"  {entry.name}{suffix}{size}")
+            return "\n".join(entries) if entries else "(空目录)"
+        except Exception as e:
+            return f"[错误] 列出目录失败: {e}"
+
+    return [read_file_tool, run_code_tool, write_file_tool, list_dir_tool]
+
+
+def create_paper_agent_tools(output_dir: str) -> list:
+    """Create read-only LangChain tools for the PaperAgent (no code execution).
+
+    PaperAgent needs read_file (verify numbers against source data),
+    list_dir (confirm chart files exist), and write_file (save drafts).
+
+    Args:
+        output_dir: Root output directory for file operations.
+
+    Returns:
+        List of LangChain BaseTool instances.
+    """
+    try:
+        from langchain_core.tools import tool
+    except ImportError:
+        raise ImportError(
+            "langchain_core is required to create LangChain tools. "
+            "Install with: pip install langchain-core"
+        )
+
+    @tool
+    def read_file_tool(path: str) -> str:
+        """Read a file at the given path. Returns its contents as a string.
+
+        Use this to read Layer 1/2/3 output files, data files, or your own
+        previous drafts to verify numbers, formulas, and facts.
+        """
+        return read_problem_file(path)
+
+    @tool
+    def list_dir_tool(
+        path: str = ".",
+    ) -> str:
+        """List files in a directory. Returns a newline-separated list.
+
+        Use this to check what chart files exist in results/ before citing
+        them in the paper.
+        """
+        p = Path(path).expanduser().resolve()
+        if not p.exists():
+            return f"[错误] 目录不存在: {p}"
+        if not p.is_dir():
+            return f"[错误] 不是目录: {p}"
+        try:
+            entries = []
+            for entry in sorted(p.iterdir()):
+                suffix = "/" if entry.is_dir() else ""
+                size = f" ({entry.stat().st_size:,} bytes)" if entry.is_file() else ""
+                entries.append(f"  {entry.name}{suffix}{size}")
+            return "\n".join(entries) if entries else "(空目录)"
+        except Exception as e:
+            return f"[错误] 列出目录失败: {e}"
+
+    @tool
+    def write_file_tool(
+        content: str,
+        path: str,
+    ) -> str:
+        """Write content to a file. Parent directories are created as needed.
+
+        Use this to save the final paper or intermediate drafts.
+        """
+        p = Path(path).expanduser().resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            p.write_text(content, encoding="utf-8")
+            logger.info("write_file_tool: wrote %d chars to %s", len(content), p)
+            return f"文件已写入: {p} ({len(content)} 字符)"
+        except Exception as e:
+            logger.exception("write_file_tool failed for %s", p)
+            return f"[错误] 写入失败: {e}"
+
+    return [read_file_tool, list_dir_tool, write_file_tool]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -306,5 +555,7 @@ __all__ = [
     "web_search",
     "save_result",
     "create_langchain_tools",
+    "create_coding_agent_tools",
+    "create_paper_agent_tools",
     "DEFAULT_ALLOWED_MODULES",
 ]

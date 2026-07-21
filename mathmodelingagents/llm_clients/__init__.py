@@ -36,7 +36,7 @@ _BACKOFF_BASE = 2.0  # 2s → 4s → 8s
 _MIN_CONTENT_CHARS = 10  # 低于此长度的输出视为模型故障
 
 
-def _is_retryable(error: Exception) -> bool:
+def is_retryable_error(error: Exception) -> bool:
     """判断异常是否可重试（瞬态故障）。"""
     msg = str(error).lower()
     for code in _RETRYABLE_CODES:
@@ -76,7 +76,7 @@ def _invoke_with_retry(
             return result
         except Exception as e:
             last_error = e
-            if attempt < _MAX_RETRIES and _is_retryable(e):
+            if attempt < _MAX_RETRIES and is_retryable_error(e):
                 delay = _BACKOFF_BASE ** attempt
                 logger.warning(
                     f"[{layer}] {agent_name} 第 {attempt}/{_MAX_RETRIES} 次失败（可重试），"

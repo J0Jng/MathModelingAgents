@@ -67,6 +67,7 @@ class AgentState(TypedDict, total=False):
     # ═══ Layer 4 产出 ═══
     paper_outline: str
     final_paper: str
+    paper_feedback: str       # PaperManager REVISE 时的审查意见
     paper_messages: list
 
     # ═══ Layer 5 产出 ═══

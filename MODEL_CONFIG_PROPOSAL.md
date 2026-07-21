@@ -1,6 +1,15 @@
-# MathModelingAgents 模型配置方案 v3 ✅ 已实施
+# MathModelingAgents 模型配置方案 v4 ✅ 已实施
 
-> **更新时间**: 2026-07-17 · **状态**: 已部署到代码
+> **更新时间**: 2026-07-21 · **状态**: 已部署到代码
+>
+> **v4 变更（2026-07-21）**:
+> - Layer 3: AlgorithmDesigner + Coder + Visualizer → **CodingAgent**（有工具、内部 Agentic 循环，2 Agent）
+> - Layer 4: PaperArchitect + SectionWriter + ChartDesigner → **PaperAgent**（有工具、分节迭代，2 Agent）
+> - 全部 System Prompt 静态化（prompt caching 优化）
+> - 15 agents（从 19 减少）
+> - 模型配置简化：Layer 3 只需 `coder` + `manager`，Layer 4 只需 `writer` + `manager`
+>
+> **v3 变更（2026-07-17）**: 见下方历史记录
 
 ---
 

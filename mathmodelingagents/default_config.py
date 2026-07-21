@@ -49,16 +49,12 @@ _DEFAULT_LAYER_MODEL_OVERRIDES: dict = {
     },
     # ── Layer 3: 代码实现 ──
     "implementation": {
-        "algorithm": "deepseek-v4-flash",
         "coder": "deepseek-v4-pro",
-        "visualizer": "deepseek-v4-flash",
         "manager": "deepseek-v4-pro",
     },
     # ── Layer 4: 论文写作 ──
     "paper": {
-        "architect": "deepseek-v4-flash",
         "writer": "qwen3.7-max",
-        "visualizer": "deepseek-v4-flash",
         "manager": "deepseek-v4-pro",
     },
     # ── Layer 5: 敏感性分析 ──
@@ -124,9 +120,6 @@ DEFAULT_CONFIG: dict = {
         # 原则：一致性高的用低温，需要辩论多样性的用中温
         "manager": 0.1,         # 裁决需要稳定，同输入同输出
         "coder": 0.0,           # 代码必须是确定性的
-        "algorithm": 0.1,       # 算法设计接近代码，稳定为主
-        "visualizer": 0.1,      # 图表生成需要一致
-        "architect": 0.3,       # 论文大纲可有些微调
         "writer": 0.5,          # 正文需要表达多样性
     },
 
