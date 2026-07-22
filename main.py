@@ -16,73 +16,125 @@ from mathmodelingagents.graph.modeling_graph import MathModelingGraph
 
 
 def _verify_layer3_code(output_dir: str) -> str:
-    """从 Layer 3 输出中提取代码块，实际执行并验证。
+    """从 Layer 3 输出的 code/ 目录执行 Python 文件验证。
 
-    从 Layer3_代码实现.md 中提取 Python 代码块，
-    逐个执行并检查是否报错。生成验证报告。
+    优先执行 code/ 目录下的实际脚本（CodingAgent 通过 write_file 工具产出），
+    以 main/solver 命名的文件优先。如果 code/ 目录不存在，回退到从
+    Layer3_代码实现.md 中提取代码块拼接执行。
     """
-    layer3_path = Path(output_dir) / "Layer3_代码实现.md"
-    if not layer3_path.exists():
-        return "Layer3_代码实现.md 不存在，跳过代码验证"
+    output_path = Path(output_dir)
+    code_dir = output_path / "code"
 
-    content = layer3_path.read_text(encoding="utf-8")
-    # 提取所有 Python 代码块
-    code_blocks = re.findall(r"```python\n(.*?)```", content, re.DOTALL)
-    if not code_blocks:
-        return "未找到 Python 代码块"
+    # ── 路径 A：执行 code/ 目录中的实际脚本 ──
+    python_files: list[Path] = []
+    if code_dir.is_dir():
+        python_files = sorted(
+            f for f in code_dir.iterdir()
+            if f.suffix == ".py" and f.name != "_exec.py"
+        )
+        # 优先执行主求解器：文件名含 solver/main/run 的排前面
+        def _priority(p: Path) -> int:
+            name = p.stem.lower()
+            if "main" in name or "run" in name:
+                return 0
+            if "solver" in name:
+                return 1
+            if "chart" in name or "plot" in name or "figure" in name:
+                return 3
+            return 2
+        python_files.sort(key=_priority)
 
-    report_lines = ["## 代码验证报告", f"找到 {len(code_blocks)} 个 Python 代码块\n"]
-    passed = 0
-    failed = 0
+    if python_files:
+        report_lines = [
+            "## 代码验证报告",
+            f"code/ 目录中找到 {len(python_files)} 个 Python 文件，按优先级执行\n",
+        ]
+        passed = 0
+        failed = 0
+        for f in python_files:
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(f)],
+                    capture_output=True, text=True, timeout=120,
+                    cwd=str(code_dir),
+                )
+                if result.returncode == 0:
+                    passed += 1
+                    stdout_preview = result.stdout.strip()[:300]
+                    line = f"- {f.name}: ✅ 通过"
+                    if stdout_preview:
+                        line += f"\n  stdout: {stdout_preview}"
+                    report_lines.append(line)
+                else:
+                    failed += 1
+                    stderr_preview = result.stderr.strip()[:300]
+                    report_lines.append(
+                        f"- {f.name}: ❌ 失败 (exit={result.returncode})\n"
+                        f"  stderr: {stderr_preview}"
+                    )
+            except subprocess.TimeoutExpired:
+                failed += 1
+                report_lines.append(f"- {f.name}: ❌ 超时 (120s)")
+            except Exception as e:
+                failed += 1
+                report_lines.append(f"- {f.name}: ❌ 执行异常: {e}")
 
-    for i, block in enumerate(code_blocks):
-        # 跳过空代码块
-        if not block.strip():
-            continue
-        # 写入临时文件执行
+        total = passed + failed
+        if failed == 0:
+            summary = f"\n### 结果: ✅ {passed}/{total} 全部通过"
+        else:
+            summary = f"\n### 结果: {passed} 通过, {failed} 失败\n⚠️ 代码验证失败，Layer 3 输出不可信"
+        report_lines.append(summary)
+    else:
+        # ── 路径 B：回退到从 Markdown 提取代码块拼接执行 ──
+        layer3_md = output_path / "Layer3_代码实现.md"
+        if not layer3_md.exists():
+            return "Layer3_代码实现.md 不存在，且 code/ 目录无 Python 文件，跳过代码验证"
+
+        content = layer3_md.read_text(encoding="utf-8")
+        code_blocks = re.findall(r"```python\n(.*?)```", content, re.DOTALL)
+        code_blocks = [b for b in code_blocks if b.strip()]
+        if not code_blocks:
+            return "未找到 Python 代码块，且 code/ 目录无 Python 文件"
+
+        report_lines = [
+            "## 代码验证报告",
+            f"从 Layer3_代码实现.md 提取到 {len(code_blocks)} 个 Python 代码块，拼接为完整脚本执行\n",
+        ]
+        combined_code = "\n\n".join(code_blocks)
+
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", delete=False, encoding="utf-8"
-        ) as f:
-            f.write(block)
-            tmp_path = f.name
+        ) as f_tmp:
+            f_tmp.write(combined_code)
+            tmp_path = f_tmp.name
 
         try:
             result = subprocess.run(
-                ["python3", tmp_path],
-                capture_output=True, text=True, timeout=60,
-                cwd=str(Path(output_dir).parent),
+                [sys.executable, tmp_path],
+                capture_output=True, text=True, timeout=120,
+                cwd=str(output_path.parent),
             )
             if result.returncode == 0:
-                passed += 1
-                stdout_preview = result.stdout.strip()[:200]
-                report_lines.append(
-                    f"- 代码块 {i+1}: ✅ 通过 (stdout: {stdout_preview})"
-                )
+                stdout_preview = result.stdout.strip()[:500]
+                report_lines.append("### 结果: ✅ 整体执行通过")
+                if stdout_preview:
+                    report_lines.append(f"\nstdout:\n```\n{stdout_preview}\n```")
             else:
-                failed += 1
-                stderr_preview = result.stderr.strip()[:200]
+                stderr_preview = result.stderr.strip()[:800]
                 report_lines.append(
-                    f"- 代码块 {i+1}: ❌ 失败 (exit={result.returncode})\n"
-                    f"  stderr: {stderr_preview}"
+                    f"### 结果: ❌ 执行失败 (exit={result.returncode})\n"
+                    f"\nstderr:\n```\n{stderr_preview}\n```"
                 )
         except subprocess.TimeoutExpired:
-            failed += 1
-            report_lines.append(f"- 代码块 {i+1}: ❌ 超时 (60s)")
+            report_lines.append("### 结果: ❌ 执行超时 (120s)")
         except Exception as e:
-            failed += 1
-            report_lines.append(f"- 代码块 {i+1}: ❌ 执行异常: {e}")
+            report_lines.append(f"### 结果: ❌ 执行异常: {e}")
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
-    summary = (
-        f"\n### 结果: {passed} 通过, {failed} 失败\n"
-        f"{'⚠️ 代码验证失败，Layer 3 输出不可信' if failed > 0 else '✅ 全部代码通过验证'}"
-    )
-    report_lines.append(summary)
-
     report = "\n".join(report_lines)
-    # 写入验证报告
-    verify_path = Path(output_dir) / "CODE_VERIFICATION.md"
+    verify_path = output_path / "CODE_VERIFICATION.md"
     verify_path.write_text(report, encoding="utf-8")
     return report
 

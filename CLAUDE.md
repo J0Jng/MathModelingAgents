@@ -5,17 +5,25 @@ Multi-agent mathematical modeling framework using LangGraph. 5-layer architectur
 ## Architecture
 - Layer 1: Problem Analysis (Decomposer → DataAnalyst → ConstraintAnalyst → ProblemManager, 4 agents)
 - Layer 2: Mathematical Modeling (ModelerA → ModelerB → ModelerC → ModelingManager, debate loop, 4 agents)
-- Layer 3: Code Implementation (CodingAgent → ImplManager, agentic tool-calling loop, 2 agents)
+- Layer 3: Code Implementation (SolverAgent → ImplManager → VizAgent, retry loop + visualization, 3 agents)
 - Layer 4: Paper Writing (PaperAgent → PaperManager, agentic section-by-section loop, 2 agents)
 - Layer 5: Sensitivity Analysis (optional, 3 agents)
 
-Total: 15 agents (down from 19 — Layer 3 and 4 merged from 3-agent chains into single tool-calling agents)
+Total: 16 agents (down from 19 — Layers 3 and 4 merged from 3-agent chains; Layer 3 split into Solver+Viz)
 
-## Layer 3 — CodingAgent
-- Single agent with real tools: run_code, read_file, write_file, list_dir
-- Internal loop (max 30 iterations): write code → execute → see output/errors → fix → re-execute
-- Self-check with SELF_CHECK_PASSED marker
-- ImplManager does external review only (no tools), issues RETRY with specific instructions
+## Layer 3 — SolverAgent + VizAgent + ImplManager
+- **SolverAgent**: Single agent with real tools: run_code, read_file, write_file, list_dir
+  - Internal loop (max 30 iterations): write code → execute → see output/errors → fix → re-execute
+  - Focus: solving math problems, producing results.json
+  - Self-check with SELF_CHECK_PASSED marker
+  - **Message persistence**: on RETRY, inherits full tool-calling history from previous run (no cold start)
+- **ImplManager**: External review only (no tools), checks solver output against Layer 2 model
+  - Issues RETRY with specific instructions when problems found
+  - On CONCLUDE: clears impl_messages to keep state clean for next layers
+- **VizAgent**: Single agent with same tools, focused on chart generation
+  - Internal loop (max 15 iterations): read results.json → generate PNG charts → verify → self-check
+  - Handles Chinese font auto-detection for chart labels
+  - Outputs to clear_impl → next layer
 
 ## Layer 4 — PaperAgent
 - Single agent with read-only tools: read_file, list_dir, write_file (NO run_code)
@@ -25,14 +33,14 @@ Total: 15 agents (down from 19 — Layer 3 and 4 merged from 3-agent chains into
 - PaperManager does external review (no tools), issues REVISE with §-level specific feedback
 
 ## Prompt Caching
-- All 15 system prompts are pure static strings (no f-string variable injection)
+- All 16 system prompts are pure static strings (no f-string variable injection)
 - Dynamic values (output_dir, round_count, retry_count, etc.) moved to user messages
 - _build_context() now includes all runtime config in the "当前状态" section
 - Enables LLM API prefix caching for 100% system prompt cache hit rate per agent
 
 ## Chinese Font Handling
 - Sandbox preamble auto-detects CJK fonts (SimHei > Microsoft YaHei > STSong > ...)
-- CodingAgent prompt requires checking font availability before using Chinese labels
+- VizAgent prompt requires checking font availability before using Chinese labels
 - Falls back to English labels if no CJK font detected (prevents tofu boxes)
 
 ## Key Files

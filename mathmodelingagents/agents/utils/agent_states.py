@@ -58,10 +58,11 @@ class AgentState(TypedDict, total=False):
 
     # ═══ Layer 3 产出 ═══
     algorithm_spec: str
-    code_results: str
+    code_results: str          # SolverAgent 最终输出（求解代码 + results.json）
+    viz_results: str           # VizAgent 最终输出（图表生成 + PNG 清单）
     visualizations: list[str]
-    error_analysis: str
-    impl_messages: list
+    error_analysis: str        # ImplManager RETRY 时的审查反馈
+    impl_messages: list        # SolverAgent 完整消息历史（RETRY 时跨轮继承）
     impl_retry_count: int
 
     # ═══ Layer 4 产出 ═══

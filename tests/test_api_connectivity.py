@@ -8,7 +8,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from mathmodelingagents.default_config import DEFAULT_CONFIG
 from mathmodelingagents.llm_clients import create_layer_llm
 from mathmodelingagents.tools import create_coding_agent_tools, create_paper_agent_tools
-from mathmodelingagents.agents.utils.prompt_templates import get_coding_agent_prompt, get_paper_agent_prompt
+from mathmodelingagents.agents.utils.prompt_templates import get_solver_agent_prompt, get_paper_agent_prompt
 
 config = DEFAULT_CONFIG.copy()
 config['output_dir'] = '/tmp/mma_api_test'

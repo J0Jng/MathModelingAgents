@@ -16,7 +16,7 @@ from mathmodelingagents.agents import (
     # Layer 2
     create_modeler_a, create_modeler_b, create_modeler_c, create_modeling_manager,
     # Layer 3
-    create_coding_agent, create_impl_manager,
+    create_solver_agent, create_viz_agent, create_impl_manager,
     # Layer 4
     create_paper_agent, create_paper_manager,
     # Layer 5
@@ -35,7 +35,7 @@ class GraphSetup:
     每层内部结构：
     - Layer 1: Decomposer → DataAnalyst → ConstraintAnalyst → ProblemManager → 路由
     - Layer 2: ModelerA → ModelerB → ModelerC → ModelingManager → 辩论路由
-    - Layer 3: CodingAgent → ImplManager → 重试路由
+    - Layer 3: SolverAgent → ImplManager → 重试路由 → VizAgent → clear_impl → 路由
     - Layer 4: PaperAgent → PaperManager → 修改路由
     - Layer 5: ParamPerturber → RobustnessAnalyst → SensitivityManager → END
     """
@@ -77,7 +77,8 @@ class GraphSetup:
         self.modeling_manager = create_modeling_manager(config)
 
         # Layer 3
-        self.coding_agent = create_coding_agent(config)
+        self.solver_agent = create_solver_agent(config)
+        self.viz_agent = create_viz_agent(config)
         self.impl_manager = create_impl_manager(config)
 
         # Layer 4
@@ -108,10 +109,10 @@ class GraphSetup:
             → (CONTINUE) → modeler_a
             → (CONCLUDE) → clear_modeling → next_layer
 
-        Layer 3 的流转（重试循环）：
-            coding_agent → impl_manager
-            → (RETRY) → coding_agent
-            → (CONCLUDE) → clear_impl → next_layer
+        Layer 3 的流转（重试循环 → 可视化）：
+            solver_agent → impl_manager
+            → (RETRY) → solver_agent
+            → (CONCLUDE) → viz_agent → clear_impl → next_layer
 
         Layer 4 的流转（修改循环）：
             paper_agent → paper_manager
@@ -164,8 +165,9 @@ class GraphSetup:
 
     def _add_layer3_nodes(self, workflow: StateGraph):
         """添加 Layer 3 节点。"""
-        workflow.add_node("coding_agent", self.coding_agent)
+        workflow.add_node("solver_agent", self.solver_agent)
         workflow.add_node("impl_manager", self.impl_manager)
+        workflow.add_node("viz_agent", self.viz_agent)
         workflow.add_node("clear_impl", self.clear_impl)
 
     def _add_layer4_nodes(self, workflow: StateGraph):
@@ -194,7 +196,7 @@ class GraphSetup:
         first_entry = {
             1: "decomposer",
             2: "modeler_a",
-            3: "coding_agent",
+            3: "solver_agent",
             4: "paper_agent",
             5: "param_perturber",
         }.get(first_layer, "decomposer")
@@ -224,12 +226,21 @@ class GraphSetup:
                 self._get_layer2_destinations(),
             )
 
-        # ── Layer 3: CodingAgent → ImplManager（重试循环）──
+        # ── Layer 3: SolverAgent → ImplManager → VizAgent → clear_impl（重试循环）──
         if 3 in self.selected_layers:
-            workflow.add_edge("coding_agent", "impl_manager")
+            workflow.add_edge("solver_agent", "impl_manager")
             workflow.add_conditional_edges(
                 "impl_manager",
                 self.conditional_logic.should_continue_impl,
+                {
+                    "solver_agent": "solver_agent",
+                    "viz_agent": "viz_agent",
+                },
+            )
+            workflow.add_edge("viz_agent", "clear_impl")
+            workflow.add_conditional_edges(
+                "clear_impl",
+                self.conditional_logic._route_after_impl,
                 self._get_layer3_destinations(),
             )
 
@@ -270,7 +281,7 @@ class GraphSetup:
         if 2 in self.selected_layers:
             dests["modeler_a"] = "modeler_a"
         if 3 in self.selected_layers:
-            dests["coding_agent"] = "coding_agent"
+            dests["solver_agent"] = "solver_agent"
         if 4 in self.selected_layers:
             dests["paper_agent"] = "paper_agent"
         if 5 in self.selected_layers:
@@ -282,7 +293,7 @@ class GraphSetup:
         """Layer 2 辩论路由目标（动态）。"""
         dests: dict = {"modeler_a": "modeler_a"}  # CONTINUE: 回辩论
         if 3 in self.selected_layers:
-            dests["coding_agent"] = "coding_agent"
+            dests["solver_agent"] = "solver_agent"
         if 4 in self.selected_layers:
             dests["paper_agent"] = "paper_agent"
         if 5 in self.selected_layers:
@@ -291,8 +302,8 @@ class GraphSetup:
         return dests
 
     def _get_layer3_destinations(self) -> dict:
-        """Layer 3 重试路由目标（动态）。"""
-        dests: dict = {"coding_agent": "coding_agent"}  # RETRY
+        """Layer 3 完成后的目标映射（clear_impl → 下一层，动态）。"""
+        dests: dict = {}
         if 4 in self.selected_layers:
             dests["paper_agent"] = "paper_agent"
         if 5 in self.selected_layers:

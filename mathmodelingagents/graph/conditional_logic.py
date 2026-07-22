@@ -83,7 +83,7 @@ class ConditionalLogic:
             state: 当前全局 AgentState。
 
         Returns:
-            "modeler_a" 继续辩论，"coding_agent" 进入 Layer 3，
+            "modeler_a" 继续辩论，"solver_agent" 进入 Layer 3，
             或 END。
         """
         debate_state = state.get("model_debate_state") or state.get("debate_state", {})
@@ -99,7 +99,7 @@ class ConditionalLogic:
         logger.info(f"Layer 2 辩论结束 (decision={judge_decision}, round={round_count})")
 
         if 3 in self.selected_layers:
-            return "coding_agent"
+            return "solver_agent"
         return self._route_to_next_layer(3)
 
     # ═══════════════════════════════════════════════════════════════
@@ -107,7 +107,7 @@ class ConditionalLogic:
     # ═══════════════════════════════════════════════════════════════
 
     def should_continue_impl(self, state: AgentState) -> str:
-        """ImplManager 后决定：重试实现还是进入 Layer 4。
+        """ImplManager 后决定：重试求解还是进入可视化。
 
         检查 error_analysis 是否为空和 retry 次数。
 
@@ -115,23 +115,19 @@ class ConditionalLogic:
             state: 当前全局 AgentState。
 
         Returns:
-            "coding_agent" 重试，"paper_agent" 进入 Layer 4，
-            或 END。
+            "solver_agent" 重试求解，"viz_agent" 进入可视化。
         """
         error_analysis = state.get("error_analysis", "")
         retry_count = state.get("impl_retry_count", 0)
 
         if error_analysis and retry_count < self.max_impl_retries:
             logger.info(
-                f"Layer 3 实现重试 (retry {retry_count + 1}/{self.max_impl_retries})"
+                f"Layer 3 求解重试 (retry {retry_count + 1}/{self.max_impl_retries})"
             )
-            return "coding_agent"
+            return "solver_agent"
 
-        logger.info(f"Layer 3 实现完成 (retries={retry_count})")
-
-        if 4 in self.selected_layers:
-            return "paper_agent"
-        return self._route_to_next_layer(4)
+        logger.info(f"Layer 3 求解通过 (retries={retry_count})，进入可视化")
+        return "viz_agent"
 
     # ═══════════════════════════════════════════════════════════════
     # Layer 4: Paper Writing 路由
@@ -186,6 +182,17 @@ class ConditionalLogic:
         logger.info("Layer 5 敏感性分析完成，流程结束")
         return END
 
+    def _route_after_impl(self, state: AgentState) -> str:
+        """clear_impl 后决定：进入 Layer 4 还是结束。"""
+        if 4 in self.selected_layers:
+            logger.info("Layer 3 → Layer 4: 进入论文写作")
+            return "paper_agent"
+        if 5 in self.selected_layers:
+            logger.info("Layer 3 → Layer 5: 进入敏感性分析")
+            return "sensitivity_scanner"
+        logger.info("Layer 3 完成，流程结束")
+        return END
+
     # ═══════════════════════════════════════════════════════════════
     # 内部辅助
     # ═══════════════════════════════════════════════════════════════
@@ -203,7 +210,7 @@ class ConditionalLogic:
         """
         layer_entry_map: dict[int, str] = {
             2: "modeler_a",
-            3: "coding_agent",
+            3: "solver_agent",
             4: "paper_agent",
             5: "sensitivity_scanner",
         }

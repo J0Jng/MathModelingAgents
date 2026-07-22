@@ -20,7 +20,7 @@
 python main.py 题目.md --provider opencode --max-rounds 2
 
 # DeepSeek API 接口（简洁，仅 flash/pro 两个模型）
-python main.py 题目.md --provider deepseek --max-rounds 1
+python main.py C:\Users\joeji\Desktop\1.绿色物流配送\绿色物流配送_完整文档.md --provider deepseek --max-rounds 3
 
 # 从中间层开始（调试用）
 python main.py 题目.md --provider opencode --max-rounds 3 --start-layer 2

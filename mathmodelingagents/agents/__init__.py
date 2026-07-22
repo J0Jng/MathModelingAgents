@@ -13,7 +13,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 from mathmodelingagents.agents.utils.agent_states import AgentState
 from mathmodelingagents.agents.utils.prompt_templates import get_prompt, get_global_constraints
-from mathmodelingagents.llm_clients import invoke_with_fallback, resolve_max_tokens, is_retryable_error
+from mathmodelingagents.llm_clients import invoke_with_fallback, resolve_max_tokens, is_retryable_error, create_layer_llm
 
 logger = logging.getLogger(__name__)
 
@@ -45,16 +45,19 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
 
     跨层原则：只注入前层的 Manager 摘要（layer_summary），不传原始辩论/代码。
     同层原则：辩论/重试循环内传递完整历史（Agent 需要互相看到发言）。
+    VizAgent 特殊处理：跳过题目描述，只给数据和路径。
     """
     parts = []
 
-    # 题目信息（所有层通用）
-    problem = state.get("problem_description", "")
-    if problem:
-        parts.append(f"## 题目内容\n\n{problem}")
+    # 题目信息（所有层通用，但 VizAgent 不需要——它只读取 results.json）
+    if agent != "viz_agent":
+        problem = state.get("problem_description", "")
+        if problem:
+            parts.append(f"## 题目内容\n\n{problem}")
 
     # ── 跨层上下文：只传精华摘要 ──
-    if layer != "problem" and state.get("layer_summary"):
+    # VizAgent 不需要跨层摘要——它只需 results.json 的路径
+    if layer != "problem" and state.get("layer_summary") and agent != "viz_agent":
         parts.append(f"## 前层综合摘要\n\n{state['layer_summary']}")
 
     # ── 同层上下文：辩论/重试循环内完整传递 ──
@@ -84,10 +87,20 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
             parts.append(f"## 建模师 C 本轮发言\n\n{debate['current_c_response']}")
 
     elif layer == "implementation":
-        if state.get("code_results"):
-            parts.append(f"## CodingAgent 产出\n\n{state['code_results']}")
-        if state.get("error_analysis"):
-            parts.append(f"## 上一轮审查意见\n\n{state['error_analysis']}")
+        if agent == "viz_agent":
+            # VizAgent 只需知道数据在哪，不需要完整 SolverAgent 输出
+            output_dir = config.get("output_dir", "output")
+            parts.append(
+                f"## 数据文件位置\n\n"
+                f"- results.json: `{output_dir}/results/results.json`\n"
+                f"- 求解脚本: `{output_dir}/code/solver.py`\n"
+                f"- 图表保存到: `{output_dir}/results/` (PNG, 150 DPI)\n"
+            )
+        else:
+            if state.get("code_results"):
+                parts.append(f"## SolverAgent 产出\n\n{state['code_results']}")
+            if state.get("error_analysis"):
+                parts.append(f"## 上一轮审查意见\n\n{state['error_analysis']}")
 
     elif layer == "paper":
         if state.get("paper_feedback"):
@@ -413,16 +426,17 @@ def create_modeling_manager(config: dict) -> Callable[[AgentState], dict[str, An
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Layer 3: Implementation — CodingAgent + ImplManager
+# Layer 3: Implementation — SolverAgent + VizAgent + ImplManager
 # ═══════════════════════════════════════════════════════════════════
 
-def create_coding_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
-    """Layer 3 Coding Agent — 有工具、自我迭代的编码 Agent。
+def create_solver_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
+    """Layer 3 Solver Agent — 有工具、自我迭代的求解 Agent。
 
     使用 LangChain tool calling 实现内部 agentic loop：
     写代码 → 执行(run_code) → 看结果 → 修复 → 再执行 → ... → 自检通过。
 
-    工具列表：run_code, read_file, write_file, list_dir
+    RETRY 时保留消息历史（impl_messages），在已有的完整对话基础上
+    追加 ImplManager 的审查反馈继续修改，而非冷启动重写。
     """
     import json as _json
     import time as _time
@@ -430,21 +444,38 @@ def create_coding_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
     from mathmodelingagents.tools import create_coding_agent_tools
 
     def node_fn(state: AgentState) -> dict[str, Any]:
-        logger.info("[Layer3] CodingAgent 开始...")
+        logger.info("[Layer3] SolverAgent 开始...")
 
-        max_tok = resolve_max_tokens(config, "coder", "coding_agent")
+        max_tok = resolve_max_tokens(config, "coder", "solver_agent")
         output_dir = config.get("output_dir", "output")
 
         # ── Build prompt and context ──
-        system_prompt = get_prompt("coding_agent")
+        system_prompt = get_prompt("solver_agent")
 
-        context = _build_context(state, "implementation", "coding_agent", config)
-        user_msg = f"请根据以下上下文执行你的任务：\n\n{context}"
+        # Check for existing messages (RETRY scenario with message persistence)
+        existing = state.get("impl_messages") or []
+        error_analysis = state.get("error_analysis", "")
 
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_msg),
-        ]
+        if existing and error_analysis:
+            # RETRY mode: continue from previous conversation, append feedback
+            logger.info(
+                f"[Layer3] SolverAgent RETRY 模式：继承 {len(existing)} 条消息，"
+                f"追加审查反馈"
+            )
+            feedback_msg = HumanMessage(content=(
+                f"## ⚠️ 上一轮审查未通过\n\n"
+                f"以下是实现经理的修改意见，请逐条修正（只修改有问题的部分，"
+                f"不要重写其他模块）：\n\n{error_analysis}"
+            ))
+            messages = existing + [feedback_msg]
+        else:
+            # First run: fresh messages
+            context = _build_context(state, "implementation", "solver_agent", config)
+            user_msg = f"请根据以下上下文执行你的任务：\n\n{context}"
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_msg),
+            ]
 
         # ── Create tools scoped to output_dir ──
         tools = create_coding_agent_tools(output_dir)
@@ -455,7 +486,9 @@ def create_coding_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
         consecutive_no_tool = 0
 
         for iteration in range(max_iterations):
-            logger.info(f"[Layer3] CodingAgent iteration {iteration + 1}/{max_iterations}")
+            logger.info(
+                f"[Layer3] SolverAgent iteration {iteration + 1}/{max_iterations}"
+            )
 
             # ── Invoke LLM with retry ──
             response = None
@@ -467,7 +500,7 @@ def create_coding_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
                     if attempt < 3 and is_retryable_error(e):
                         delay = 2 ** attempt
                         logger.warning(
-                            f"[Layer3] CodingAgent LLM 调用重试 {attempt}/3, "
+                            f"[Layer3] SolverAgent LLM 调用重试 {attempt}/3, "
                             f"{delay}s: {e}"
                         )
                         _time.sleep(delay)
@@ -496,7 +529,9 @@ def create_coding_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
                             result = tool_fn.invoke(tool_args)
                         except Exception as e:
                             result = f"[工具执行异常] {tool_name}: {e}"
-                            logger.error(f"[Layer3] 工具 {tool_name} 执行失败: {e}")
+                            logger.error(
+                                f"[Layer3] 工具 {tool_name} 执行失败: {e}"
+                            )
                     else:
                         result = f"[未知工具] {tool_name}"
 
@@ -508,7 +543,7 @@ def create_coding_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
                         content=result_str, tool_call_id=tool_id,
                     ))
                     logger.info(
-                        f"[Layer3] CodingAgent 工具 {tool_name}: "
+                        f"[Layer3] SolverAgent 工具 {tool_name}: "
                         f"{result_str[:120]}..."
                     )
             else:
@@ -517,14 +552,14 @@ def create_coding_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
 
                 if "SELF_CHECK_PASSED" in content:
                     logger.info(
-                        f"[Layer3] CodingAgent 自检通过 "
+                        f"[Layer3] SolverAgent 自检通过 "
                         f"(iteration {iteration + 1})"
                     )
                     break
 
                 if consecutive_no_tool >= 3:
                     logger.warning(
-                        f"[Layer3] CodingAgent {consecutive_no_tool} 轮无工具调用，"
+                        f"[Layer3] SolverAgent {consecutive_no_tool} 轮无工具调用，"
                         f"强制中断"
                     )
                     break
@@ -542,24 +577,184 @@ def create_coding_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
         retry_count = state.get("impl_retry_count", 0)
 
         logger.info(
-            f"[Layer3] CodingAgent 完成: {len(messages)} 条消息, "
+            f"[Layer3] SolverAgent 完成: {len(messages)} 条消息, "
             f"最终输出 {len(final_output)} 字符"
         )
 
         return {
             "code_results": final_output,
+            "impl_messages": messages,  # 保存完整历史供 RETRY 时继承
             "layer_outputs": _record(
-                state, "coding_agent", "implementation", "coder",
+                state, "solver_agent", "implementation", "coder",
                 retry_count + 1, final_output,
             ),
         }
 
-    node_fn.__name__ = "coding_agent"
+    node_fn.__name__ = "solver_agent"
+    return node_fn
+
+
+def create_viz_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
+    """Layer 3 Viz Agent — 专注图表生成，从 results.json 读取数据。
+
+    使用 LangChain tool calling 实现内部 agentic loop：
+    读 results.json → 生成图表 → 验证 → 修复 → 自检通过。
+
+    如果图表生成失败，通过 impl_messages 实现自循环重试。
+    """
+    import json as _json
+    import time as _time
+    from langchain_core.messages import ToolMessage
+    from mathmodelingagents.tools import create_coding_agent_tools
+
+    def node_fn(state: AgentState) -> dict[str, Any]:
+        logger.info("[Layer3] VizAgent 开始...")
+
+        max_tok = resolve_max_tokens(config, "coder", "viz_agent")
+        output_dir = config.get("output_dir", "output")
+
+        # ── Build prompt and context ──
+        system_prompt = get_prompt("viz_agent")
+
+        # Check for existing messages (RETRY scenario for VizAgent)
+        existing = state.get("viz_results") or ""
+
+        if existing and "SELF_CHECK_PASSED" not in existing:
+            # VizAgent RETRY: append feedback to continue fixing charts
+            logger.info("[Layer3] VizAgent RETRY 模式：继承消息继续修复图表")
+            messages = (state.get("impl_messages") or []) + [
+                HumanMessage(content=(
+                    f"## ⚠️ 上一轮图表生成未完成\n\n"
+                    f"上一轮产出如下，请检查缺失的图表并补充生成：\n\n{existing}"
+                ))
+            ]
+        else:
+            # First run: fresh messages, context from _build_context only
+            context = _build_context(state, "implementation", "viz_agent", config)
+            user_msg = (
+                f"请根据以下上下文，读取 results.json 并生成全部图表：\n\n{context}"
+            )
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_msg),
+            ]
+
+        # ── Create tools scoped to output_dir ──
+        tools = create_coding_agent_tools(output_dir)
+        llm = create_layer_llm(config, "implementation", "coder")
+        llm_with_tools = llm.bind_tools(tools)
+
+        max_iterations = 10  # 图表生成应该很快
+        consecutive_no_tool = 0
+
+        for iteration in range(max_iterations):
+            logger.info(
+                f"[Layer3] VizAgent iteration {iteration + 1}/{max_iterations}"
+            )
+
+            # ── Invoke LLM with retry ──
+            response = None
+            for attempt in range(1, 4):
+                try:
+                    response = llm_with_tools.invoke(messages)
+                    break
+                except Exception as e:
+                    if attempt < 3 and is_retryable_error(e):
+                        delay = 2 ** attempt
+                        logger.warning(
+                            f"[Layer3] VizAgent LLM 调用重试 {attempt}/3, "
+                            f"{delay}s: {e}"
+                        )
+                        _time.sleep(delay)
+                    else:
+                        raise
+
+            messages.append(response)
+
+            # ── Process tool calls ──
+            if response.tool_calls:
+                consecutive_no_tool = 0
+                for tc in response.tool_calls:
+                    tool_name = tc.get("name", "")
+                    tool_args = tc.get("args", {})
+                    tool_id = tc.get("id", "")
+
+                    tool_fn = None
+                    for t in tools:
+                        if t.name == tool_name:
+                            tool_fn = t
+                            break
+
+                    if tool_fn is not None:
+                        try:
+                            result = tool_fn.invoke(tool_args)
+                        except Exception as e:
+                            result = f"[工具执行异常] {tool_name}: {e}"
+                            logger.error(
+                                f"[Layer3] 工具 {tool_name} 执行失败: {e}"
+                            )
+                    else:
+                        result = f"[未知工具] {tool_name}"
+
+                    result_str = (
+                        _json.dumps(result, ensure_ascii=False)
+                        if isinstance(result, dict) else str(result)
+                    )
+                    messages.append(ToolMessage(
+                        content=result_str, tool_call_id=tool_id,
+                    ))
+                    logger.info(
+                        f"[Layer3] VizAgent 工具 {tool_name}: "
+                        f"{result_str[:120]}..."
+                    )
+            else:
+                consecutive_no_tool += 1
+                content = response.content or ""
+
+                if "SELF_CHECK_PASSED" in content:
+                    logger.info(
+                        f"[Layer3] VizAgent 自检通过 "
+                        f"(iteration {iteration + 1})"
+                    )
+                    break
+
+                if consecutive_no_tool >= 3:
+                    logger.warning(
+                        f"[Layer3] VizAgent {consecutive_no_tool} 轮无工具调用，"
+                        f"强制中断"
+                    )
+                    break
+
+        # ── Extract final text output ──
+        final_output = ""
+        for msg in reversed(messages):
+            content = getattr(msg, "content", "") or ""
+            has_tools = bool(getattr(msg, "tool_calls", None))
+            tool_msg = getattr(msg, "type", "") == "tool"
+            if content and not has_tools and not tool_msg:
+                final_output = content
+                break
+
+        logger.info(
+            f"[Layer3] VizAgent 完成: {len(messages)} 条消息, "
+            f"最终输出 {len(final_output)} 字符"
+        )
+
+        return {
+            "viz_results": final_output,
+            "impl_messages": messages,  # 保存供潜在 VizAgent 自循环
+            "layer_outputs": _record(
+                state, "viz_agent", "implementation", "coder",
+                1, final_output,
+            ),
+        }
+
+    node_fn.__name__ = "viz_agent"
     return node_fn
 
 
 def create_impl_manager(config: dict) -> Callable[[AgentState], dict[str, Any]]:
-    """实现经理 — 外部审查 CodingAgent 的产出，决定 RETRY/CONCLUDE。"""
+    """实现经理 — 外部审查 SolverAgent 的产出，决定 RETRY/CONCLUDE。"""
     def node_fn(state: AgentState) -> dict[str, Any]:
         logger.info("[Layer3] ImplManager 执行中...")
 
@@ -577,7 +772,7 @@ def create_impl_manager(config: dict) -> Callable[[AgentState], dict[str, Any]]:
 
         context = _build_context(state, "implementation", "impl_manager", config)
         user_msg = (
-            f"请审查 CodingAgent 的产出并裁决"
+            f"请审查 SolverAgent 的产出并裁决"
             f"（当前重试 {retry_count}/{max_retries}）：\n\n{context}"
         )
 
@@ -635,6 +830,8 @@ def create_impl_manager(config: dict) -> Callable[[AgentState], dict[str, Any]]:
                 result if not error_analysis
                 else state.get("code_results", "")
             ),
+            # CONCLUDE 时清空消息历史，保证进入下一层的 state 精简
+            "impl_messages": [] if not error_analysis else state.get("impl_messages", []),
             "layer_outputs": _record(
                 state, "impl_manager", "implementation", "manager",
                 retry_count, result,
@@ -655,6 +852,9 @@ def create_paper_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
     使用 LangChain tool calling 实现内部 agentic loop：
     读前三层产出 → 分节撰写 → 核实数据 → 修改 → 自检通过。
 
+    REVISE 时保留消息历史（paper_messages），在已有对话基础上
+    追加 PaperManager 的审查反馈继续修改，而非冷启动重写。
+
     工具列表：read_file, list_dir, write_file（只读为主，无 run_code）
     """
     import json as _json
@@ -671,13 +871,30 @@ def create_paper_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
         # ── Build prompt and context ──
         system_prompt = get_prompt("paper_agent")
 
-        context = _build_context(state, "paper", "paper_agent", config)
-        user_msg = f"请根据以下上下文执行你的任务：\n\n{context}"
+        # Check for existing messages (REVISE scenario with message persistence)
+        existing = state.get("paper_messages") or []
+        paper_feedback = state.get("paper_feedback", "")
 
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_msg),
-        ]
+        if existing and paper_feedback:
+            # REVISE mode: continue from previous conversation, append feedback
+            logger.info(
+                f"[Layer4] PaperAgent REVISE 模式：继承 {len(existing)} 条消息，"
+                f"追加审查反馈"
+            )
+            feedback_msg = HumanMessage(content=(
+                f"## ⚠️ 上一轮审查未通过\n\n"
+                f"以下是论文经理的修改意见，请逐条修正（只修改有问题的节，"
+                f"不要重写其他节）：\n\n{paper_feedback}"
+            ))
+            messages = existing + [feedback_msg]
+        else:
+            # First run: fresh messages
+            context = _build_context(state, "paper", "paper_agent", config)
+            user_msg = f"请根据以下上下文执行你的任务：\n\n{context}"
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_msg),
+            ]
 
         # ── Create tools (read-only: no run_code) ──
         tools = create_paper_agent_tools(output_dir)
@@ -784,6 +1001,7 @@ def create_paper_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
 
         return {
             "final_paper": final_output,
+            "paper_messages": messages,  # 保存完整历史供 REVISE 时继承
             "layer_outputs": _record(
                 state, "paper_agent", "paper", "writer",
                 round_num, final_output,
@@ -795,8 +1013,24 @@ def create_paper_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
 
 
 def create_paper_manager(config: dict) -> Callable[[AgentState], dict[str, Any]]:
-    """论文经理 — 纯审查，不给工具。逐条指出需要修改的节。"""
-    return _make_manager_node(config, "paper_manager", "paper")
+    """论文经理 — 纯审查，不给工具。逐条指出需要修改的节。
+
+    REVISE 时保留 paper_messages，CONCLUDE 时清空。
+    """
+    base_manager = _make_manager_node(config, "paper_manager", "paper")
+
+    def node_fn(state: AgentState) -> dict[str, Any]:
+        result = base_manager(state)
+        # 根据裁决决定是否清空 paper_messages
+        debate = state.get("model_debate_state") or state.get("debate_state") or {}
+        judge_decision = debate.get("judge_decision", "CONCLUDE")
+        if "REVISE" not in judge_decision:
+            # CONCLUDE: 清空消息历史
+            result["paper_messages"] = []
+        return result
+
+    node_fn.__name__ = "paper_manager"
+    return node_fn
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -833,7 +1067,7 @@ __all__ = [
     "create_problem_manager",
     "create_modeler_a", "create_modeler_b", "create_modeler_c",
     "create_modeling_manager",
-    "create_coding_agent", "create_impl_manager",
+    "create_solver_agent", "create_viz_agent", "create_impl_manager",
     "create_paper_agent", "create_paper_manager",
     "create_param_perturber", "create_robustness_analyst",
     "create_sensitivity_manager",

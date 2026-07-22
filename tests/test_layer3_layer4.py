@@ -1,5 +1,5 @@
 """
-Comprehensive tests for Layer 3 (CodingAgent) and Layer 4 (PaperAgent) redesign.
+Comprehensive tests for Layer 3 (SolverAgent + VizAgent) and Layer 4 (PaperAgent) redesign.
 Tests mock LLM calls to verify tool-calling loop logic, graph topology, and prompt quality.
 """
 import json
@@ -7,10 +7,10 @@ from unittest.mock import MagicMock
 
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
 
-from mathmodelingagents.agents import create_coding_agent, create_impl_manager
+from mathmodelingagents.agents import create_solver_agent, create_viz_agent, create_impl_manager
 from mathmodelingagents.agents import create_paper_agent, create_paper_manager
 from mathmodelingagents.agents.utils.prompt_templates import (
-    get_coding_agent_prompt, get_impl_manager_prompt,
+    get_solver_agent_prompt, get_viz_agent_prompt, get_impl_manager_prompt,
     get_paper_agent_prompt, get_paper_manager_prompt,
 )
 from mathmodelingagents.tools import create_coding_agent_tools, create_paper_agent_tools
@@ -18,14 +18,14 @@ from mathmodelingagents.graph.setup import GraphSetup
 from mathmodelingagents.default_config import DEFAULT_CONFIG
 
 
-def test_coding_agent_factory():
-    """Test CodingAgent factory creates the right structure."""
+def test_solver_agent_factory():
+    """Test SolverAgent factory creates the right structure."""
     config = DEFAULT_CONFIG.copy()
     config['output_dir'] = '/tmp/test_mma_output'
     config['layer_timeouts'] = {'implementation': 10800}
 
-    node = create_coding_agent(config)
-    assert node.__name__ == 'coding_agent'
+    node = create_solver_agent(config)
+    assert node.__name__ == 'solver_agent'
 
     tools = create_coding_agent_tools(config['output_dir'])
     names = [t.name for t in tools]
@@ -33,6 +33,16 @@ def test_coding_agent_factory():
     assert 'read_file_tool' in names
     assert 'write_file_tool' in names
     assert 'list_dir_tool' in names
+
+
+def test_viz_agent_factory():
+    """Test VizAgent factory creates the right structure."""
+    config = DEFAULT_CONFIG.copy()
+    config['output_dir'] = '/tmp/test_mma_output'
+    config['layer_timeouts'] = {'implementation': 10800}
+
+    node = create_viz_agent(config)
+    assert node.__name__ == 'viz_agent'
 
 
 def test_paper_agent_factory():
@@ -120,11 +130,11 @@ def test_graph_topology():
     mermaid = g.get_graph().draw_mermaid()
 
     # New nodes present
-    for node in ['coding_agent', 'impl_manager', 'paper_agent', 'paper_manager']:
+    for node in ['solver_agent', 'viz_agent', 'impl_manager', 'paper_agent', 'paper_manager']:
         assert node in mermaid, f"Missing node: {node}"
 
     # Old nodes removed
-    old_nodes = ['algorithm_designer', 'coder', 'visualizer',
+    old_nodes = ['coding_agent', 'algorithm_designer', 'coder', 'visualizer',
                  'paper_architect', 'section_writer', 'chart_designer']
     for old in old_nodes:
         assert old not in mermaid, f"Stale node: {old}"
@@ -132,20 +142,30 @@ def test_graph_topology():
 
 def test_prompts():
     """Verify prompt content quality."""
-    ca = get_coding_agent_prompt()
+    sa = get_solver_agent_prompt()
+    va = get_viz_agent_prompt()
     im = get_impl_manager_prompt()
     pa = get_paper_agent_prompt()
     pm = get_paper_manager_prompt()
 
-    # CodingAgent
-    assert 'run_code' in ca
-    assert 'SELF_CHECK_PASSED' in ca
-    assert '30' in ca
+    # SolverAgent
+    assert 'run_code' in sa
+    assert 'SELF_CHECK_PASSED' in sa
+    assert 'results.json' in sa
+    # 不再包含图表生成相关内容
+    assert 'plt.savefig' not in sa, "SolverAgent should NOT include chart generation"
+
+    # VizAgent
+    assert 'run_code' in va
+    assert 'SELF_CHECK_PASSED' in va
+    assert 'plt.savefig' in va
+    assert 'results.json' in va
+    assert '15' in va  # max_iterations for VizAgent
 
     # ImplManager
     assert 'CONCLUDE' in im
     assert 'RETRY' in im
-    assert 'CodingAgent' in im
+    assert ('SolverAgent' in im) or ('CodingAgent' in im)
 
     # PaperAgent
     assert ('分节' in pa) or ('逐节' in pa), "Missing section-by-section"
@@ -186,7 +206,8 @@ def test_graph_entry_points():
 
 if __name__ == '__main__':
     tests = [
-        test_coding_agent_factory,
+        test_solver_agent_factory,
+        test_viz_agent_factory,
         test_paper_agent_factory,
         test_tool_calling_loop,
         test_safety_break,

@@ -97,6 +97,7 @@ class Propagator:
             # ═══ Layer 3 ═══
             "algorithm_spec": "",
             "code_results": "",
+            "viz_results": "",
             "visualizations": [],
             "error_analysis": "",
             "impl_messages": [],
