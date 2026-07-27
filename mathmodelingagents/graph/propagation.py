@@ -90,8 +90,6 @@ class Propagator:
             # ═══ Layer 2 ═══
             "model_debate_state": initial_debate_state,
             "model_spec": "",
-            "formulas": "",
-            "solution_approach": "",
             "model_validation": "",
             "modeling_messages": [],
             # ═══ Layer 3 ═══
@@ -113,7 +111,6 @@ class Propagator:
             # ═══ 元信息 ═══
             "current_layer": "1",
             "layer_results": {},
-            "debate_state": initial_debate_state,
             "layer_outputs": [],
         }
 

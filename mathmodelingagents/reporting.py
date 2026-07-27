@@ -254,7 +254,7 @@ def _build_summary(all_outputs: list[dict], state: dict) -> str:
         lines.append(f"| {title} | {unique_agents} | {max_round} | {total_chars:,} |")
 
     lines.append("\n---\n## 各层裁决结果\n")
-    debate = state.get("model_debate_state") or state.get("debate_state") or {}
+    debate = state.get("model_debate_state") or {}
     jd = debate.get("judge_decision", "N/A")
     rc = debate.get("round_count", "N/A")
     lines.append(f"- Layer 2 建模辩论: **{jd}** (共 {rc} 轮)")

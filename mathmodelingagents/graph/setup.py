@@ -56,6 +56,9 @@ class GraphSetup:
         # 条件路由逻辑
         self.conditional_logic = ConditionalLogic(
             max_debate_rounds=self.max_debate_rounds,
+            max_problem_rounds=config.get("max_problem_rounds", 5),
+            max_modeling_rounds=config.get("max_modeling_rounds", 5),
+            max_revision_rounds=config.get("max_revision_rounds", 8),
             max_impl_retries=config.get("max_impl_retries", 3),
             selected_layers=self.selected_layers,
         )
@@ -203,15 +206,24 @@ class GraphSetup:
 
         workflow.add_edge(START, first_entry)
 
-        # ── Layer 1: 顺序连接 ──
+        # ── Layer 1: 顺序连接 + 辩论循环 ──
         if 1 in self.selected_layers:
             workflow.add_edge("decomposer", "data_analyst")
             workflow.add_edge("data_analyst", "constraint_analyst")
             workflow.add_edge("constraint_analyst", "problem_manager")
-            workflow.add_edge("problem_manager", "clear_problem")
+            # ProblemManager 辩论路由：CONTINUE → decomposer, CONCLUDE → clear_problem
+            workflow.add_conditional_edges(
+                "problem_manager",
+                self.conditional_logic.should_continue_problem,
+                {
+                    "decomposer": "decomposer",
+                    "clear_problem": "clear_problem",
+                },
+            )
+            # clear_problem 后路由到下一层
             workflow.add_conditional_edges(
                 "clear_problem",
-                self.conditional_logic.should_continue_problem,
+                self.conditional_logic._route_after_problem,
                 self._get_layer1_destinations(),
             )
 

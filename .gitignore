@@ -11,13 +11,24 @@ __pycache__/
 dist/
 *.egg-info/
 
+# 测试
+.pytest_cache/
+tests/
+
 # 运行时输出
 results/
 cache/
+code/
 
-# IDE
+# IDE / 工具
 .vscode/
 .idea/
+.codegraph/
+
+# 本地草稿 & 临时文件
+.scratch/
+UNRESOLVED.md
+*.html
 
 # OS
 .DS_Store

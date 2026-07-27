@@ -5,6 +5,7 @@
 
 import logging
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from typing import Any
 from mathmodelingagents.default_config import DEFAULT_CONFIG
 from mathmodelingagents.graph.propagation import Propagator
 from mathmodelingagents.graph.setup import GraphSetup
+from mathmodelingagents.graph.checkpointer import get_checkpointer
 from mathmodelingagents.agents.utils.agent_states import AgentState
 
 logger = logging.getLogger(__name__)
@@ -63,7 +65,13 @@ class MathModelingGraph:
 
         # 构建并编译图
         self.workflow = self.graph_setup.setup_graph()
-        self.graph = self.workflow.compile()
+        checkpoint_enabled = self.config.get("checkpoint_enabled", False)
+        self.checkpointer = None
+        if checkpoint_enabled:
+            output_dir = self.config.get("output_dir", "")
+            if output_dir:
+                self.checkpointer = get_checkpointer(output_dir)
+        self.graph = self.workflow.compile(checkpointer=self.checkpointer)
 
         logger.info("MathModelingGraph 初始化完成，图已编译")
 
@@ -113,15 +121,29 @@ class MathModelingGraph:
         # ── 流式执行，逐节点写盘 ──
         logger.info("正在流式执行图...")
         prev_count = 0
+        last_layer = ""
         result = initial_state
 
         try:
+            stream_config = {"recursion_limit": self.propagator.max_recur_limit}
+            if self.checkpointer:
+                thread_id = output_name or initial_state.get("output_name", "default")
+                stream_config["configurable"] = {"thread_id": thread_id}
+
             for chunk in self.graph.stream(
                 initial_state,
                 stream_mode="values",
-                config={"recursion_limit": self.propagator.max_recur_limit},
+                config=stream_config,
             ):
                 result = chunk
+                # 检测当前层
+                current = result.get("current_layer", "")
+                layer_names = {"1": "L1·问题分析", "2": "L2·数学建模", "3": "L3·代码实现", "4": "L4·论文写作", "5": "L5·敏感性分析"}
+                if current and current != last_layer:
+                    last_layer = current
+                    print(f"\n{'='*50}", flush=True)
+                    print(f"  {layer_names.get(current, current)} 开始", flush=True)
+                    print(f"{'='*50}", flush=True)
                 outputs = chunk.get("layer_outputs", [])
                 # 写入新增的记录
                 for rec in outputs[prev_count:]:

@@ -19,14 +19,15 @@ logging.basicConfig(
 )
 
 # ── 配置 ──
-EXISTING_OUTPUT = Path(r"C:\Users\joeji\Desktop\绿色物流配送_完整文档")
-PROBLEM_FILE = Path(r"C:\Users\joeji\Desktop\1.绿色物流配送\绿色物流配送_完整文档.md")
+EXISTING_OUTPUT = Path(r"C:\Users\joeji\Desktop\绿色物流配送_test")
+PROBLEM_FILE = Path(r"C:\Users\joeji\Desktop\杂乱\绿色物流配送_完整文档.md")
 OUTPUT_NAME = "绿色物流配送_L3重跑"
 
 config = DEFAULT_CONFIG.copy()
 config["llm_provider"] = "deepseek"
 config["selected_layers"] = [3, 4]  # 只跑 Layer 3 + 4
-config["max_debate_rounds"] = 3     # 给 PaperManager 足够的 REVISE 轮次
+config["max_modeling_rounds"] = 5   # Layer 2 建模（已跳过但保留配置）
+config["max_revision_rounds"] = 3    # Layer 4 论文修改轮次
 config["max_impl_retries"] = 3
 
 # ── 读取已有 Layer 2 数据 ──
@@ -74,7 +75,6 @@ initial_state = mm.propagator.create_initial_state(
     output_name=OUTPUT_NAME,
 )
 initial_state["layer_summary"] = layer_summary
-initial_state["solution_approach"] = model_summary
 initial_state["model_spec"] = model_summary
 
 # ── 确定输出目录 ──

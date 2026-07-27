@@ -79,3 +79,34 @@ Total: 16 agents (down from 19 — Layers 3 and 4 merged from 3-agent chains; La
 ## Standard
 - Python with type hints
 - pytest for tests
+
+## Agent skills
+
+### Issue tracker
+Issues are tracked as GitHub Issues in this repo (`https://github.com/J0Jng/MathModelingAgents`). See `docs/agents/issue-tracker.md` for the `gh` CLI conventions and wayfinding operations.
+
+### Triage labels
+This repo uses the five canonical triage labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md` for the mapping.
+
+### Domain model
+Core domain terminology is documented in `docs/agents/domain.md`. Consult it when:
+- You need to understand the 5-layer architecture, agent roles, or debate semantics
+- You're writing code that interacts with `AgentState`, `DebateState`, or the sandbox
+- You need the mapping between layer names, agent names, and roles for config changes
+
+Key reference: `docs/agents/domain.md` — agents table, roles, routing decisions, and file layout.
+
+### Using skills
+When working on this project, prefer these skill patterns:
+- **Implementing features or fixing bugs**: use `/tdd` (test-driven development) — write a failing test first, then implement
+- **Diagnosing hard bugs**: use `/diagnosing-bugs` for systematic root-cause analysis
+- **Code review before committing**: use `/code-review` to catch correctness and simplification issues
+- **Researching a topic**: use `/research` to gather facts from trusted sources and write findings to a Markdown file
+- **Verifying a change works**: use `/verify` to run the app and confirm behavior
+- **Updating config/hooks**: use `/update-config` for settings.json changes (permissions, env vars, hooks)
+
+### Architecture decisions
+For significant design decisions affecting the 5-layer architecture or LangGraph topology:
+- Document the decision in the domain model (`docs/agents/domain.md`)
+- Use `/domain-modeling` if the change introduces new concepts or redefines existing ones
+- Use `/codebase-design` when designing new module interfaces or deepening existing ones

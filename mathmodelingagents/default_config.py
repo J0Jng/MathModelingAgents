@@ -126,7 +126,9 @@ DEFAULT_CONFIG: dict = {
     # ═══════════════════════════════════════════════
     # 辩论配置
     # ═══════════════════════════════════════════════
-    "max_debate_rounds": int(_env("max_debate_rounds", "10")),
+    "max_modeling_rounds": int(_env("max_modeling_rounds", "5")),
+    "max_revision_rounds": int(_env("max_revision_rounds", "8")),
+    "max_debate_rounds": int(_env("max_debate_rounds", "10")),  # DEPRECATED: 请使用 max_modeling_rounds / max_revision_rounds
     "max_impl_retries": int(_env("max_impl_retries", "3")),
 
     # ═══════════════════════════════════════════════
@@ -144,6 +146,7 @@ DEFAULT_CONFIG: dict = {
     # ═══════════════════════════════════════════════
     "output_dir": _env("output_dir"),
     "output_format": _env("output_format", "obsidian_md"),
+    "checkpoint_enabled": _env("checkpoint_enabled", "false").lower() == "true",
     "data_cache_dir": _env("data_cache_dir", "./cache"),
     "results_dir": _env("results_dir", "./results"),
 

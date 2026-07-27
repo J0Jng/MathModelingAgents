@@ -36,6 +36,141 @@ def _record(state: AgentState, agent: str, layer: str, role: str,
     return records
 
 
+def _extract_final_output(messages: list) -> str:
+    """从消息列表中提取最后一个非工具调用的文本输出。
+
+    从消息列表末尾反向遍历，找到第一条有内容且不含 tool_calls
+    且不是 tool 类型消息的内容，作为 Agent 的最终文本输出。
+
+    Args:
+        messages: LangChain 消息列表。
+
+    Returns:
+        Agent 最终文本输出，若未找到则返回空字符串。
+    """
+    for msg in reversed(messages):
+        content = getattr(msg, "content", "") or ""
+        has_tools = bool(getattr(msg, "tool_calls", None))
+        tool_msg = getattr(msg, "type", "") == "tool"
+        if content and not has_tools and not tool_msg:
+            return content
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ImplManager 文件扫描辅助 — 参考 TradingAgents Manager 模式：
+# 不依赖工具调用，在 LLM 调用前用 Python 扫描磁盘产出、
+# 将文件清单和关键内容注入审查上下文。
+# ═══════════════════════════════════════════════════════════════════
+
+def _scan_solver_output(output_dir: str) -> dict:
+    """扫描 SolverAgent 在磁盘上的产出文件。
+
+    返回 dict:
+        file_count: 文件总数
+        file_names: 文件名列表
+        file_details: 每个文件的详细信息（大小、行数等）
+        results_json_summary: results.json 的摘要（若存在）
+        code_file_listing: 代码文件路径列表
+    """
+    from pathlib import Path
+    import json as _json
+
+    root = Path(output_dir)
+    result = {
+        "file_count": 0,
+        "file_names": [],
+        "file_details": [],
+        "results_json_summary": "",
+        "code_file_listing": [],
+    }
+
+    # 扫描 code/ 目录
+    code_dir = root / "code"
+    if code_dir.is_dir():
+        for f in sorted(code_dir.iterdir()):
+            if f.is_file():
+                size = f.stat().st_size
+                lines = f.read_text(encoding="utf-8", errors="replace").count("\n") + 1
+                result["file_count"] += 1
+                result["file_names"].append(f"code/{f.name}")
+                result["file_details"].append(
+                    f"  code/{f.name} — {size:,} bytes, {lines} 行"
+                )
+                result["code_file_listing"].append(str(f))
+
+    # 扫描 results/ 目录
+    results_dir = root / "results"
+    if results_dir.is_dir():
+        for f in sorted(results_dir.iterdir()):
+            if f.is_file():
+                size = f.stat().st_size
+                result["file_count"] += 1
+                result["file_names"].append(f"results/{f.name}")
+
+                if f.suffix == ".json":
+                    result["file_details"].append(
+                        f"  results/{f.name} — {size:,} bytes (JSON)"
+                    )
+                    if f.name == "results.json":
+                        try:
+                            data = _json.loads(f.read_text(encoding="utf-8"))
+                            keys = list(data.keys()) if isinstance(data, dict) else []
+                            result["results_json_summary"] = (
+                                f"results.json 存在，包含顶层键: {keys}"
+                            )
+                            # 提取每个子问题的关键数值
+                            for key in keys:
+                                if isinstance(data[key], dict):
+                                    nums = {
+                                        k: v for k, v in data[key].items()
+                                        if isinstance(v, (int, float)) and not isinstance(v, bool)
+                                    }
+                                    if nums:
+                                        result["results_json_summary"] += (
+                                            f"\n  {key}: {nums}"
+                                        )
+                        except Exception:
+                            result["results_json_summary"] = "results.json 存在但解析失败"
+
+                elif f.suffix == ".png":
+                    result["file_details"].append(
+                        f"  results/{f.name} — {size:,} bytes (PNG 图表)"
+                    )
+                else:
+                    desc = f"  results/{f.name} — {size:,} bytes"
+                    if not f.suffix:
+                        desc += " (无扩展名)"
+                    result["file_details"].append(desc)
+
+    return result
+
+
+def _format_file_evidence(evidence: dict) -> str:
+    """将扫描结果格式化为 ImplManager 审查上下文的一部分。"""
+    parts = ["## 🔍 SolverAgent 磁盘产出扫描"]
+
+    if evidence["file_count"] == 0:
+        parts.append(
+            "\n⚠️ **未发现任何磁盘产出文件。** SolverAgent 可能未实际执行代码 "
+            "或未保存结果。"
+        )
+        return "\n".join(parts)
+
+    parts.append(f"\n扫描到 **{evidence['file_count']}** 个文件：\n")
+    parts.extend(evidence["file_details"])
+
+    if evidence["results_json_summary"]:
+        parts.append(f"\n### results.json 内容摘要\n{evidence['results_json_summary']}")
+
+    if evidence["code_file_listing"]:
+        parts.append(f"\n### 代码文件列表 ({len(evidence['code_file_listing'])} 个)")
+        for p in evidence["code_file_listing"]:
+            parts.append(f"  - {p}")
+
+    return "\n".join(parts)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 基础 LLM 节点工厂
 # ═══════════════════════════════════════════════════════════════════
@@ -43,7 +178,8 @@ def _record(state: AgentState, agent: str, layer: str, role: str,
 def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> str:
     """根据层和角色，从 state 中构建传给 LLM 的上下文。
 
-    跨层原则：只注入前层的 Manager 摘要（layer_summary），不传原始辩论/代码。
+    跨层原则：建模层传入完整 problem_report，实现层传入完整 model_spec，
+    论文层和敏感性层传入 layer_summary 摘要（Agent 用工具获取完整数据）。
     同层原则：辩论/重试循环内传递完整历史（Agent 需要互相看到发言）。
     VizAgent 特殊处理：跳过题目描述，只给数据和路径。
     """
@@ -56,8 +192,9 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
             parts.append(f"## 题目内容\n\n{problem}")
 
     # ── 跨层上下文：只传精华摘要 ──
-    # VizAgent 不需要跨层摘要——它只需 results.json 的路径
-    if layer != "problem" and state.get("layer_summary") and agent != "viz_agent":
+    # 建模层和实现层已有完整的前层输出（problem_report / model_spec），摘要冗余
+    # 论文层和敏感性层保留摘要作为快速定位（Agent 用工具获取完整数据）
+    if layer not in ("problem", "modeling", "implementation") and state.get("layer_summary"):
         parts.append(f"## 前层综合摘要\n\n{state['layer_summary']}")
 
     # ── 同层上下文：辩论/重试循环内完整传递 ──
@@ -72,7 +209,10 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
             parts.append(f"## 假设清单\n\n{state['assumptions']}")
 
     elif layer == "modeling":
-        debate = state.get("model_debate_state") or state.get("debate_state") or {}
+        # Layer 1 完整分析是建模的基础（替代摘要，提供完整的问题定义/数据/约束）
+        if state.get("problem_report"):
+            parts.append(f"## Layer 1 综合问题分析（建模基准——阅读后开始设计模型）\n\n{state['problem_report']}")
+        debate = state.get("model_debate_state", {})
         if debate.get("a_history"):
             parts.append(f"## 建模师 A 历史发言\n\n{debate['a_history']}")
         if debate.get("b_history"):
@@ -97,6 +237,9 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
                 f"- 图表保存到: `{output_dir}/results/` (PNG, 150 DPI)\n"
             )
         else:
+            # Layer 2 model_spec 是编码的基准——必须原样传递给 SolverAgent 和 ImplManager
+            if state.get("model_spec"):
+                parts.append(f"## Layer 2 最终模型方案（编码基准——必须严格对照实现）\n\n{state['model_spec']}")
             if state.get("code_results"):
                 parts.append(f"## SolverAgent 产出\n\n{state['code_results']}")
             if state.get("error_analysis"):
@@ -115,7 +258,7 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
             parts.append(f"## 敏感性报告\n\n{state['sensitivity_report']}")
 
     # 元信息
-    debate = state.get("model_debate_state") or state.get("debate_state") or {}
+    debate = state.get("model_debate_state", {})
     round_info = debate.get("round_count", 0)
     max_rounds = config.get("max_debate_rounds", 10)
     remaining = max(0, max_rounds - round_info)
@@ -154,6 +297,9 @@ def _make_llm_node(
     """
     def node_fn(state: AgentState) -> dict[str, Any]:
         logger.info(f"[{layer}] {agent_name} 执行中...")
+        from mathmodelingagents.llm_clients import get_layer_model
+        model = get_layer_model(config, layer, role)
+        print(f"[{layer}] {agent_name} ⏳ calling {model}...", flush=True)
 
         # ── 解析 max_tokens ──
         max_tok = resolve_max_tokens(config, role, agent_name)
@@ -177,6 +323,7 @@ def _make_llm_node(
         try:
             result = invoke_with_fallback(config, layer, role, messages, agent_name, max_tokens=max_tok)
             logger.info(f"[{layer}] {agent_name} 完成，输出 {len(result)} 字符")
+            print(f"[{layer}] {agent_name} ✅ {len(result)} chars", flush=True)
         except Exception as e:
             logger.error(f"[{layer}] {agent_name} 全部降级耗尽: {e}")
             result = f"LLM 调用失败（全部降级耗尽）: {e}"
@@ -201,12 +348,15 @@ def _make_manager_node(
     """
     def node_fn(state: AgentState) -> dict[str, Any]:
         logger.info(f"[{layer}] {agent_name} 执行中...")
+        from mathmodelingagents.llm_clients import get_layer_model
+        model = get_layer_model(config, layer, role)
+        print(f"[{layer}] {agent_name} ⏳ calling {model}...", flush=True)
 
         # ── 解析 max_tokens ──
         max_tok = resolve_max_tokens(config, role, agent_name)
 
         # 辩论状态
-        debate = dict(state.get("model_debate_state") or state.get("debate_state") or {})
+        debate = dict(state.get("model_debate_state", {}))
         round_count = debate.get("round_count", 0) + 1
 
         # 静态 prompt + 层摘要要求
@@ -251,7 +401,6 @@ def _make_manager_node(
 
         updates: dict[str, Any] = {
             "model_debate_state": debate,
-            "debate_state": debate,
         }
 
         # ── 提取层摘要（仅 CONCLUDE 时）──
@@ -284,8 +433,6 @@ def _make_manager_node(
             updates["problem_report"] = result
         elif layer == "modeling":
             updates["model_spec"] = result
-            updates["solution_approach"] = result
-            updates["formulas"] = result
         elif layer == "implementation":
             updates["code_results"] = result
         elif layer == "paper":
@@ -300,6 +447,7 @@ def _make_manager_node(
             updates["sensitivity_report"] = result
 
         logger.info(f"[{layer}] {agent_name} 裁决: {judge_decision} (round {round_count})")
+        print(f"[{layer}] {agent_name} ✅ {judge_decision} ({len(result)} chars)", flush=True)
         updates["layer_outputs"] = _record(state, agent_name, layer, role, round_count, result)
         return updates
 
@@ -373,7 +521,7 @@ def _make_modeler_node(
         # ── 解析 max_tokens ──
         max_tok = resolve_max_tokens(config, "agent", agent_name)
 
-        debate = dict(state.get("model_debate_state") or state.get("debate_state") or {})
+        debate = dict(state.get("model_debate_state", {}))
         round_count = debate.get("round_count", 0)  # 不递增，由 Manager 管理轮数
 
         system_prompt = get_prompt(agent_name)
@@ -401,7 +549,6 @@ def _make_modeler_node(
 
         return {
             "model_debate_state": debate,
-            "debate_state": debate,
             "layer_outputs": _record(state, agent_name, "modeling", "agent", round_count, result),
         }
 
@@ -458,6 +605,18 @@ def create_solver_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
 
         if existing and error_analysis:
             # RETRY mode: continue from previous conversation, append feedback
+            # 截断策略：保留前 2 条（system+user）+ 后 18 条（最新上下文），
+            # 中间截断防止消息历史过长导致上下文溢出或 API 崩溃。
+            # 参考 TradingAgents：辩论历史是累积的文本字符串，而非完整消息列表。
+            if len(existing) > 24:
+                truncated = existing[:2] + existing[-18:]
+                logger.info(
+                    f"[Layer3] SolverAgent RETRY 截断消息: "
+                    f"{len(existing)} → {len(truncated)} "
+                    f"(保留首2+尾18)"
+                )
+                existing = truncated
+
             logger.info(
                 f"[Layer3] SolverAgent RETRY 模式：继承 {len(existing)} 条消息，"
                 f"追加审查反馈"
@@ -565,14 +724,31 @@ def create_solver_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
                     break
 
         # ── Extract final text output ──
-        final_output = ""
-        for msg in reversed(messages):
-            content = getattr(msg, "content", "") or ""
-            has_tools = bool(getattr(msg, "tool_calls", None))
-            tool_msg = getattr(msg, "type", "") == "tool"
-            if content and not has_tools and not tool_msg:
-                final_output = content
-                break
+        final_output = _extract_final_output(messages)
+
+        # 如果没有 SELF_CHECK_PASSED 但工具已经产生了结果（max iterations
+        # 用尽），追加一次 summary 调用让 LLM 总结已完成的工作。
+        # 这确保 ImplManager 始终能看到有意义的产出描述。
+        if "SELF_CHECK_PASSED" not in final_output:
+            logger.info("[Layer3] SolverAgent 未自检通过，追加 summary 调用...")
+            try:
+                summary_msg = HumanMessage(content=(
+                    "你的工具调用轮次已用完。请用一段文字总结你的工作成果：\n"
+                    "1. 你创建了哪些代码文件？（用 write_file 保存的）\n"
+                    "2. results.json 保存在哪里？里面有哪些关键数值？\n"
+                    "3. 代码是否能成功执行？如果还有问题，列出未解决的部分。\n\n"
+                    "请直接总结，不要调用工具。"
+                ))
+                summary_response = llm.invoke(messages + [summary_msg])
+                summary_text = summary_response.content or ""
+                if summary_text:
+                    final_output = summary_text
+                    logger.info(
+                        f"[Layer3] SolverAgent summary: "
+                        f"{len(summary_text)} 字符"
+                    )
+            except Exception as e:
+                logger.warning(f"[Layer3] SolverAgent summary 调用失败: {e}")
 
         retry_count = state.get("impl_retry_count", 0)
 
@@ -726,14 +902,7 @@ def create_viz_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
                     break
 
         # ── Extract final text output ──
-        final_output = ""
-        for msg in reversed(messages):
-            content = getattr(msg, "content", "") or ""
-            has_tools = bool(getattr(msg, "tool_calls", None))
-            tool_msg = getattr(msg, "type", "") == "tool"
-            if content and not has_tools and not tool_msg:
-                final_output = content
-                break
+        final_output = _extract_final_output(messages)
 
         logger.info(
             f"[Layer3] VizAgent 完成: {len(messages)} 条消息, "
@@ -754,7 +923,12 @@ def create_viz_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
 
 
 def create_impl_manager(config: dict) -> Callable[[AgentState], dict[str, Any]]:
-    """实现经理 — 外部审查 SolverAgent 的产出，决定 RETRY/CONCLUDE。"""
+    """实现经理 — 外部审查 SolverAgent 的产出，决定 RETRY/CONCLUDE。
+
+    参考 TradingAgents 的 Manager 模式：单次 LLM 调用，不做工具循环。
+    但在调用前扫描磁盘产出（代码文件、results.json 等），将文件清单
+    和关键文件内容注入审查上下文，确保 Manager 能基于实际产出判断。
+    """
     def node_fn(state: AgentState) -> dict[str, Any]:
         logger.info("[Layer3] ImplManager 执行中...")
 
@@ -762,6 +936,17 @@ def create_impl_manager(config: dict) -> Callable[[AgentState], dict[str, Any]]:
 
         retry_count = state.get("impl_retry_count", 0) + 1
         max_retries = config.get("max_impl_retries", 3)
+        output_dir = config.get("output_dir", "output")
+
+        # ── 扫描 SolverAgent 磁盘产出 ──
+        # 参考 TradingAgents：Manager 的 prompt 中直接注入完整的文本产出，
+        # 不做工具调用循环。在调用 LLM 前用 Python 扫描文件清单，
+        # 确保 Manager 能看到 SolverAgent 实际保存的文件。
+        file_evidence = _scan_solver_output(output_dir)
+        logger.info(
+            f"[Layer3] ImplManager 扫描到 {file_evidence['file_count']} 个文件: "
+            f"{', '.join(file_evidence['file_names'][:10])}"
+        )
 
         system_prompt = (
             get_prompt("impl_manager")
@@ -771,9 +956,13 @@ def create_impl_manager(config: dict) -> Callable[[AgentState], dict[str, Any]]:
         )
 
         context = _build_context(state, "implementation", "impl_manager", config)
+
+        # 追加文件证据到审查上下文
+        evidence_text = _format_file_evidence(file_evidence)
         user_msg = (
             f"请审查 SolverAgent 的产出并裁决"
             f"（当前重试 {retry_count}/{max_retries}）：\n\n{context}"
+            f"\n\n---\n\n{evidence_text}"
         )
 
         messages = [
@@ -983,14 +1172,48 @@ def create_paper_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
                     break
 
         # ── Extract final text output ──
-        final_output = ""
-        for msg in reversed(messages):
-            content = getattr(msg, "content", "") or ""
-            has_tools = bool(getattr(msg, "tool_calls", None))
-            tool_msg = getattr(msg, "type", "") == "tool"
-            if content and not has_tools and not tool_msg:
-                final_output = content
-                break
+        final_output = _extract_final_output(messages)
+
+        # ── 自检通过后尝试从磁盘读取完整论文正文 ──
+        # PaperAgent 通过 write_file 工具将论文写入文件，但其文本输出（final_output）
+        # 只包含自检摘要。这导致 PaperManager 看不到论文正文，反复 REVISE。
+        # 修复：SELF_CHECK_PASSED 时尝试读取磁盘上的论文文件，补充到输出中。
+        if "SELF_CHECK_PASSED" in final_output:
+            from pathlib import Path as _Path
+            paper_candidates = ["paper.md", "PaperAgent_paper.md", "final_paper.md"]
+            paper_dir = _Path(output_dir)
+            paper_text = ""
+            for fname in paper_candidates:
+                fpath = paper_dir / fname
+                if fpath.is_file():
+                    try:
+                        paper_text = fpath.read_text(encoding="utf-8")
+                        logger.info(
+                            f"[Layer4] PaperAgent 从磁盘读取论文: "
+                            f"{fpath.name} ({len(paper_text)} 字符)"
+                        )
+                        break
+                    except Exception as e:
+                        logger.warning(
+                            f"[Layer4] PaperAgent 读取论文文件失败 {fpath}: {e}"
+                        )
+            # 如果读取到论文正文，用它替换 final_output（保留自检标记）
+            # 这样 PaperManager 就能看到完整论文内容进行审查
+            if paper_text and len(paper_text) > len(final_output):
+                combined = (
+                    f"{final_output}\n\n"
+                    f"---\n"
+                    f"## 论文正文\n\n{paper_text}"
+                )
+                final_output = combined
+                logger.info(
+                    f"[Layer4] PaperAgent 输出已补充论文正文: "
+                    f"{len(paper_text)} 字符"
+                )
+            else:
+                logger.info(
+                    f"[Layer4] PaperAgent 未找到论文文件，已回退到文本输出"
+                )
 
         round_num = (state.get("model_debate_state") or {}).get("round_count", 0) or 1
 
@@ -1022,7 +1245,7 @@ def create_paper_manager(config: dict) -> Callable[[AgentState], dict[str, Any]]
     def node_fn(state: AgentState) -> dict[str, Any]:
         result = base_manager(state)
         # 根据裁决决定是否清空 paper_messages
-        debate = state.get("model_debate_state") or state.get("debate_state") or {}
+        debate = state.get("model_debate_state", {})
         judge_decision = debate.get("judge_decision", "CONCLUDE")
         if "REVISE" not in judge_decision:
             # CONCLUDE: 清空消息历史

@@ -51,8 +51,6 @@ class AgentState(TypedDict, total=False):
     # ═══ Layer 2 产出 ═══
     model_debate_state: DebateState
     model_spec: str
-    formulas: str
-    solution_approach: str
     model_validation: str
     modeling_messages: list
 
@@ -79,5 +77,4 @@ class AgentState(TypedDict, total=False):
     # ═══ 元信息 ═══
     current_layer: str
     layer_results: dict
-    debate_state: DebateState  # 通用辩论状态引用
     layer_summary: str          # 跨层摘要（每层 Manager 产出，仅精华注入下层）

@@ -72,12 +72,20 @@ def _invoke_with_retry(
                     f"模型返回空/极短内容 ({len(result)} 字符)，视为模型故障"
                 )
             if attempt > 1:
+                print(f"  [{layer}] {agent_name} ✅ retry succeeded on attempt {attempt}", flush=True)
                 logger.info(f"[{layer}] {agent_name} 第 {attempt} 次尝试成功")
             return result
         except Exception as e:
             last_error = e
             if attempt < _MAX_RETRIES and is_retryable_error(e):
                 delay = _BACKOFF_BASE ** attempt
+                err_code = ""
+                msg = str(e).lower()
+                if "503" in msg: err_code = "503"
+                elif "502" in msg: err_code = "502"
+                elif "504" in msg: err_code = "504"
+                elif "429" in msg: err_code = "429"
+                print(f"  [{layer}] {agent_name} 🔄 retry {attempt}/{_MAX_RETRIES} ({err_code or 'err'}, {delay:.0f}s backoff)", flush=True)
                 logger.warning(
                     f"[{layer}] {agent_name} 第 {attempt}/{_MAX_RETRIES} 次失败（可重试），"
                     f"{delay:.0f}s 后重试: {e}"
@@ -295,6 +303,7 @@ def invoke_with_fallback(
             return result
         except Exception as e:
             last_error = e
+            print(f"  [{layer}] {agent_name} ⚠️ {prov}/{model} unavailable → trying next fallback", flush=True)
             logger.warning(f"[{layer}] {agent_name} step{step_num} ({prov}/{model}) 不可用: {e}")
 
     raise RuntimeError(f"[{layer}] {agent_name} 降级链全部失败: {last_error}")

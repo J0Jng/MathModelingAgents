@@ -189,6 +189,8 @@ def main():
     if args.provider:
         config["llm_provider"] = args.provider
     config["max_debate_rounds"] = args.max_rounds
+    config["max_modeling_rounds"] = args.max_rounds
+    config["max_revision_rounds"] = args.max_rounds
     config["enable_sensitivity"] = args.sensitivity
     config["selected_layers"] = list(range(args.start_layer, 5))
 

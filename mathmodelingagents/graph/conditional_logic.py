@@ -30,6 +30,9 @@ class ConditionalLogic:
     def __init__(
         self,
         max_debate_rounds: int = 10,
+        max_problem_rounds: int = 5,
+        max_modeling_rounds: int = 5,
+        max_revision_rounds: int = 8,
         max_risk_discuss_rounds: int = 10,
         max_impl_retries: int = 3,
         selected_layers: list[int] | None = None,
@@ -37,12 +40,18 @@ class ConditionalLogic:
         """初始化路由逻辑。
 
         Args:
-            max_debate_rounds: 辩论最大轮数。
+            max_debate_rounds: (DEPRECATED) 辩论最大轮数，保留向后兼容。
+            max_problem_rounds: Layer 1 问题分析辩论最大轮数。
+            max_modeling_rounds: Layer 2 建模辩论最大轮数。
+            max_revision_rounds: Layer 4 论文修改最大轮数。
             max_risk_discuss_rounds: 风险讨论最大轮数。
             max_impl_retries: 实现重试最大次数。
             selected_layers: 用户选择的层列表，默认 [1,2,3,4]。
         """
-        self.max_debate_rounds = max_debate_rounds
+        self.max_debate_rounds = max_debate_rounds  # deprecated
+        self.max_problem_rounds = max_problem_rounds
+        self.max_modeling_rounds = max_modeling_rounds
+        self.max_revision_rounds = max_revision_rounds
         self.max_risk_discuss_rounds = max_risk_discuss_rounds
         self.max_impl_retries = max_impl_retries
         self.selected_layers = selected_layers or [1, 2, 3, 4]
@@ -52,11 +61,34 @@ class ConditionalLogic:
     # ═══════════════════════════════════════════════════════════════
 
     def should_continue_problem(self, state: AgentState) -> str:
-        """Layer 1 结束后决定：进入 Layer 2 还是跳过。
+        """Layer 1 ProblemManager 后决定：继续分析还是进入清理。
 
-        从 ProblemManager 节点后调用。
-        如果 Layer 2 在 selected_layers 中，路由到 modeler_a；
-        否则查找下一个启用的层。
+        读取 debate_state 中的 judge_decision 和 round_count，
+        判断是否达到最大轮数或已得出结论。
+
+        Args:
+            state: 当前全局 AgentState。
+
+        Returns:
+            "decomposer" 继续分析，"clear_problem" 进入清理后路由下一层。
+        """
+        debate_state = state.get("model_debate_state", {})
+        judge_decision = debate_state.get("judge_decision", "CONCLUDE")
+        round_count = debate_state.get("round_count", 0)
+
+        if judge_decision == "CONTINUE" and round_count < self.max_problem_rounds:
+            logger.info(
+                f"Layer 1 问题分析继续 (round {round_count}/{self.max_problem_rounds})"
+            )
+            return "decomposer"
+
+        logger.info(
+            f"Layer 1 问题分析结束 (decision={judge_decision}, round={round_count})"
+        )
+        return "clear_problem"
+
+    def _route_after_problem(self, state: AgentState) -> str:
+        """clear_problem 后决定：进入 Layer 2 还是跳过。
 
         Args:
             state: 当前全局 AgentState。
@@ -86,13 +118,13 @@ class ConditionalLogic:
             "modeler_a" 继续辩论，"solver_agent" 进入 Layer 3，
             或 END。
         """
-        debate_state = state.get("model_debate_state") or state.get("debate_state", {})
+        debate_state = state.get("model_debate_state", {})
         judge_decision = debate_state.get("judge_decision", "CONCLUDE")
         round_count = debate_state.get("round_count", 0)
 
-        if judge_decision == "CONTINUE" and round_count < self.max_debate_rounds:
+        if judge_decision == "CONTINUE" and round_count < self.max_modeling_rounds:
             logger.info(
-                f"Layer 2 辩论继续 (round {round_count}/{self.max_debate_rounds})"
+                f"Layer 2 辩论继续 (round {round_count}/{self.max_modeling_rounds})"
             )
             return "modeler_a"
 
@@ -120,10 +152,14 @@ class ConditionalLogic:
         error_analysis = state.get("error_analysis", "")
         retry_count = state.get("impl_retry_count", 0)
 
+        if "**RETRY**" in error_analysis:
+            # 显式标记：直接触发重试
+            logger.info(f"Layer 3 检测到显式 RETRY 标记 (retry {retry_count + 1}/{self.max_impl_retries})")
+            return "solver_agent"
         if error_analysis and retry_count < self.max_impl_retries:
-            logger.info(
-                f"Layer 3 求解重试 (retry {retry_count + 1}/{self.max_impl_retries})"
-            )
+            # 无显式标记但 error_analysis 非空（ImplManager fallback 分支），
+            # 视为 RETRY 意图，避免 LLM 格式漂移导致静默通过
+            logger.info(f"Layer 3 fallback RETRY (retry {retry_count + 1}/{self.max_impl_retries})")
             return "solver_agent"
 
         logger.info(f"Layer 3 求解通过 (retries={retry_count})，进入可视化")
@@ -145,13 +181,13 @@ class ConditionalLogic:
         Returns:
             "paper_agent" 退回修改，或 "clear_paper" 进入下一层。
         """
-        debate = state.get("model_debate_state") or state.get("debate_state") or {}
+        debate = state.get("model_debate_state") or {}
         judge_decision = debate.get("judge_decision", "CONCLUDE")
         round_count = debate.get("round_count", 0)
 
-        if "REVISE" in judge_decision and round_count < self.max_debate_rounds:
+        if "REVISE" in judge_decision and round_count < self.max_revision_rounds:
             logger.info(
-                f"Layer 4 论文退回修改 (round {round_count}/{self.max_debate_rounds})"
+                f"Layer 4 论文退回修改 (round {round_count}/{self.max_revision_rounds})"
             )
             return "paper_agent"
 
