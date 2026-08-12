@@ -46,6 +46,7 @@ class AgentState(TypedDict, total=False):
     constraints: str
     assumptions: str
     data_insights: str
+    background_research: str        # Layer 1 自动搜索的题目背景资料（原始文本，供 Layer 2 注入）
     problem_messages: list
 
     # ═══ Layer 2 产出 ═══

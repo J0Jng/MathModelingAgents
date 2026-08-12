@@ -21,6 +21,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
+import urllib.error
+import urllib.request
 
 logger = logging.getLogger(__name__)
 
@@ -265,3 +268,38 @@ def web_search(query: str, max_results: int = 5) -> str:
         return f"[搜索失败] {error_summary or '未知错误'}"
 
     return _format_results(query, provider, results)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# URL verification
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def check_url(url: str) -> str:
+    """Verify a URL is reachable. Returns a short verdict string (never raises).
+
+    Verdicts:
+      ✅ 可达 (HTTP xxx)              — 2xx/3xx
+      ⚠️ 疑似存在但被拒绝访问 (HTTP xxx) — 401/403（反爬常见，不算失效）
+      ⚠️ 服务器临时错误 (HTTP xxx)     — 5xx
+      ❌ 失效 (HTTP xxx)              — 4xx（除 401/403）
+      ❌ 无法连接 — <原因>             — 超时 / DNS / 连接失败
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    req = urllib.request.Request(url, headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            code = resp.getcode()
+            return f"✅ 可达 (HTTP {code})"
+    except urllib.error.HTTPError as e:
+        code = e.code
+        if code in (401, 403):
+            return f"⚠️ 疑似存在但被拒绝访问 (HTTP {code})"
+        if 500 <= code < 600:
+            return f"⚠️ 服务器临时错误 (HTTP {code})"
+        return f"❌ 失效 (HTTP {code})"
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+        return f"❌ 无法连接 — {_truncate_error(e)}"
+    except Exception as e:
+        return f"❌ 无法连接 — {_truncate_error(e)}"

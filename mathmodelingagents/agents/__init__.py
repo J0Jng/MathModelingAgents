@@ -310,6 +310,8 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
         # Layer 1 完整分析是建模的基础（替代摘要，提供完整的问题定义/数据/约束）
         if state.get("problem_report"):
             parts.append(f"## Layer 1 综合问题分析（建模基准——阅读后开始设计模型）\n\n{state['problem_report']}")
+        if state.get("background_research"):
+            parts.append(f"## 题目背景资料（Layer 1 自动搜索）\n\n{state['background_research']}")
         debate = state.get("model_debate_state", {})
         if debate.get("a_history"):
             parts.append(f"## 建模师 A 历史发言\n\n{debate['a_history']}")
@@ -566,13 +568,29 @@ def create_decomposer(config: dict) -> Callable[[AgentState], dict[str, Any]]:
         user_msg = f"请根据以下上下文执行你的任务：\n\n{context}"
 
         # ── 预搜索注入：题目背景知识（失败静默，不影响主流程）──
+        search_combined = ""
         try:
+            from mathmodelingagents.tools.web_search import web_search
             problem_text = (state.get("problem_description") or "").strip()
             if problem_text:
-                from mathmodelingagents.tools.web_search import web_search
-                search_result = web_search(problem_text[:150], max_results=3)
-                if not search_result.startswith("[搜索失败]") and not search_result.startswith("[搜索未启用]"):
-                    user_msg += "\n\n## 题目背景资料（自动搜索）\n\n" + search_result
+                parts_search = []
+
+                # 查询 1: 题目背景（题目前 150 字符）
+                r1 = web_search(problem_text[:150], max_results=5)
+                if not r1.startswith("[搜索失败]") and not r1.startswith("[搜索未启用]"):
+                    parts_search.append(f"### 查询 1（题目背景）\n{r1}")
+
+                # 查询 2: 建模方法参考（题目首行 + " 数学建模"）
+                first_line = problem_text.split("\n")[0].strip()
+                if len(first_line) >= 10:
+                    q2 = (first_line[:80] + " 数学建模").strip()
+                    r2 = web_search(q2, max_results=3)
+                    if not r2.startswith("[搜索失败]") and not r2.startswith("[搜索未启用]"):
+                        parts_search.append(f"### 查询 2（建模方法参考）\n{r2}")
+
+                if parts_search:
+                    search_combined = "\n\n".join(parts_search)
+                    user_msg += "\n\n## 题目背景资料（自动搜索）\n\n" + search_combined
         except Exception as e:
             logger.info("[Layer1] Decomposer 背景搜索跳过: %s", e)
 
@@ -587,6 +605,7 @@ def create_decomposer(config: dict) -> Callable[[AgentState], dict[str, Any]]:
             result = f"LLM 调用失败（全部降级耗尽）: {e}"
         return {
             "problem_report": result,
+            "background_research": search_combined,  # 原始搜索资料（可能为空字符串），供 Layer 2 直接使用
             "layer_outputs": _record(state, "decomposer", "problem", "agent", 1, result),
         }
 

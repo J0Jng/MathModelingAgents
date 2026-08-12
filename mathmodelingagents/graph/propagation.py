@@ -78,6 +78,7 @@ class Propagator:
             # ═══ 输入 ═══
             "problem_path": str(problem_file.resolve()),
             "problem_description": problem_description,
+            "background_research": "",
             "output_name": output_name,
             # ═══ 消息历史 ═══
             "messages": [],

@@ -538,7 +538,13 @@ def create_paper_agent_tools(output_dir: str) -> list:
             logger.exception("write_file_tool failed for %s", p)
             return f"[错误] 写入失败: {e}"
 
-    return [read_file_tool, list_dir_tool, write_file_tool]
+    @tool
+    def check_url_tool(url: str) -> str:
+        """Verify a reference URL is reachable. Returns: ✅ 可达 / ⚠️ 反爬或临时错误 / ❌ 失效或无法连接."""
+        from mathmodelingagents.tools.web_search import check_url
+        return check_url(url)
+
+    return [read_file_tool, list_dir_tool, write_file_tool, check_url_tool]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

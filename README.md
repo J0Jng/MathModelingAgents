@@ -125,8 +125,8 @@ prefix caching 可以命中。动态值（路径、轮次、重试次数等）�
 
 ### Web 搜索（题目背景知识）
 
-Layer 1 的 Decomposer 会自动对题目关键词联网搜索背景资料并注入上下文；
-Layer 3 的 SolverAgent 可自主调用 `web_search` 查询数据字段含义、算法资料。
+Layer 1 的 Decomposer 自动进行**多角度联网搜索**（题目背景 + 建模方法），背景资料注入问题拆解与 Layer 2 建模上下文；
+Layer 3 的 SolverAgent 可自主调用 `web_search` 查询数据字段含义、算法资料。Layer 4 的 PaperAgent 写参考文献前会用 `check_url` 验证每条 URL 的真实可达性，失效引用自动剔除。
 
 - **后端**：Tavily（免费 1000 次/月，推荐）或 ddgs（DuckDuckGo，免费无 key）
 - **配置**：`MATHMODELING_WEB_SEARCH_PROVIDER=auto|tavily|ddgs|off`（默认 `auto`：有 key 用 Tavily，否则 ddgs）
