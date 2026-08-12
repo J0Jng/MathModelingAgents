@@ -151,6 +151,12 @@ DEFAULT_CONFIG: dict = {
     "results_dir": _env("results_dir", "./results"),
 
     # ═══════════════════════════════════════════════
+    # Web 搜索配置（auto = 有 TAVILY_API_KEY 用 tavily，否则 ddgs）
+    # ═══════════════════════════════════════════════
+    "web_search_provider": _env("web_search_provider", "auto"),
+    "tavily_api_key": _env("tavily_api_key") or os.getenv("TAVILY_API_KEY"),
+
+    # ═══════════════════════════════════════════════
     # 计算沙盒配置
     # ═══════════════════════════════════════════════
     "code_execution": {

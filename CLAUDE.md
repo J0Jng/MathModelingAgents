@@ -49,6 +49,7 @@ Total: 16 agents (down from 19 — Layers 3 and 4 merged from 3-agent chains; La
 - `mathmodelingagents/llm_clients/__init__.py` — LLM client factory (OpenCode Go / DeepSeek)
 - `mathmodelingagents/agents/__init__.py` — agent node factory functions (incl. tool-calling loops)
 - `mathmodelingagents/tools/__init__.py` — sandbox code execution + LangChain tool wrappers
+- `mathmodelingagents/tools/web_search.py` — real web search (tavily/ddgs), Layer 1 pre-search injection + Layer 3 solver tool
 - `mathmodelingagents/graph/setup.py` — StateGraph construction
 
 ## Known Model Issues

@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from mathmodelingagents.tools.web_search import web_search  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 # Whitelist of allowed modules for code execution
@@ -23,6 +25,10 @@ DEFAULT_ALLOWED_MODULES = [
     "numpy", "scipy", "sympy", "pandas",
     "matplotlib", "sklearn", "statsmodels", "seaborn",
 ]
+
+# Maximum allowed timeout for run_code (seconds).  LLM may request values
+# like 600+ but the sandbox enforces a hard cap to prevent single-call hangs.
+MAX_RUN_CODE_TIMEOUT = 300
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -229,7 +235,11 @@ def _exec_script(sandboxed_code: str, work_dir: str, timeout: int) -> dict[str, 
         logger.warning("run_code: timed out after %.1fs", timeout)
         return {
             "stdout": "",
-            "stderr": f"[超时] 代码执行超过 {timeout} 秒",
+            "stderr": (
+                f"[超时] 代码执行超过 {timeout} 秒被终止。"
+                "请将代码拆分为更小的执行单元（按子问题/分时段/分批循环处理），"
+                "不要在一次 run_code 中执行过长代码。"
+            ),
             "exit_code": -1,
             "success": False,
             "execution_time": round(elapsed, 3),
@@ -244,27 +254,6 @@ def _exec_script(sandboxed_code: str, work_dir: str, timeout: int) -> dict[str, 
             "success": False,
             "execution_time": round(elapsed, 3),
         }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Tool: web_search
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def web_search(query: str) -> str:
-    """Search the web (placeholder — not yet implemented).
-
-    Args:
-        query: Search query string.
-
-    Returns:
-        A placeholder message.
-    """
-    logger.info("web_search called with query: %s", query)
-    return (
-        "web_search 尚未实现。\n"
-        f"查询: {query}\n"
-        "当此功能可用时，将返回相关网页摘要和链接。"
-    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -334,6 +323,7 @@ def create_langchain_tools() -> list:
 
         Returns a JSON string with keys: stdout, stderr, exit_code, success, execution_time.
         """
+        timeout = min(timeout or MAX_RUN_CODE_TIMEOUT, MAX_RUN_CODE_TIMEOUT)
         result = run_code(code, timeout=timeout)
         return json.dumps(result, ensure_ascii=False)
 
@@ -420,6 +410,7 @@ def create_coding_agent_tools(output_dir: str) -> list:
         Returns JSON with keys: stdout, stderr, exit_code, success, execution_time.
         A non-zero exit_code means the code failed — read stderr to debug.
         """
+        timeout = min(timeout or MAX_RUN_CODE_TIMEOUT, MAX_RUN_CODE_TIMEOUT)
         result = run_code(code, timeout=timeout, cwd=work_dir)
         return json.dumps(result, ensure_ascii=False)
 
@@ -467,7 +458,12 @@ def create_coding_agent_tools(output_dir: str) -> list:
         except Exception as e:
             return f"[错误] 列出目录失败: {e}"
 
-    return [read_file_tool, run_code_tool, write_file_tool, list_dir_tool]
+    @tool
+    def web_search_tool(query: str) -> str:
+        """Search the web for background knowledge. Returns formatted results (title, url, snippet)."""
+        return web_search(query, max_results=5)
+
+    return [read_file_tool, run_code_tool, write_file_tool, list_dir_tool, web_search_tool]
 
 
 def create_paper_agent_tools(output_dir: str) -> list:
@@ -558,4 +554,5 @@ __all__ = [
     "create_coding_agent_tools",
     "create_paper_agent_tools",
     "DEFAULT_ALLOWED_MODULES",
+    "MAX_RUN_CODE_TIMEOUT",
 ]

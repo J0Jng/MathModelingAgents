@@ -6,7 +6,7 @@
 
 > 多智能体协作的数学建模竞赛全流程框架。输入题目，自动产出完整论文。
 
-**5 层架构 · 15 个专职 Agent · 辩论循环 · Agentic Tool Calling · Prompt 缓存优化 · 增量写盘容灾**
+**5 层架构 · 16 个专职 Agent · 辩论循环 · Agentic Tool Calling · Web 搜索 · Prompt 缓存优化 · 增量写盘容灾**
 
 ```
 题目文件 ──→ [L1: 问题分析] ──→ [L2: 数学建模] ──→ [L3: 代码实现] ──→ [L4: 论文写作] ──→ 完整论文
@@ -46,9 +46,9 @@ Layer 2: 数学建模（4 Agent，辩论循环）
   ModelerA → ModelerB → ModelerC → ModelingManager ──→ 继续辩论 / 通过
   产出：数学模型定义、公式推导、求解方案
 
-Layer 3: 代码实现（2 Agent，Agentic Tool Calling）
-  CodingAgent（有工具，内部循环：写→跑→修→再跑）→ ImplManager ──→ 重试 / 通过
-  产出：可运行代码、验证结果、论文级图表
+Layer 3: 代码实现（3 Agent，Agentic Tool Calling）
+  SolverAgent（有工具，内部循环：写→跑→修→再跑）→ ImplManager → VizAgent
+  产出：可运行代码、results.json、论文级图表
 
 Layer 4: 论文写作（2 Agent，Agentic Tool Calling）
   PaperAgent（有工具，分节迭代：写→读数据核实→修改）→ PaperManager ──→ 修改 / 通过
@@ -65,9 +65,10 @@ Layer 3 的 CodingAgent 和 Layer 4 的 PaperAgent 不再是单次 LLM 调用，
 **有真实工具的自主循环 Agent**：
 
 ```
-┌─ CodingAgent（30 轮 max）──────────────┐
+┌─ SolverAgent（30 轮 max）─────────────┐
 │  工具: run_code / read_file /          │
-│        write_file / list_dir           │
+│        write_file / list_dir /         │
+│        web_search                      │
 │                                        │
 │  写代码 → 执行 → 看报错 → 修复          │
 │  → 再执行 → 结果正确 → 生成图表         │
@@ -119,8 +120,17 @@ prefix caching 可以命中。动态值（路径、轮次、重试次数等）�
 ### 中文图表渲染保护
 
 沙盒执行环境自动检测中文字体（SimHei / Microsoft YaHei / STSong 等），
-若系统无中文字体则输出警告。CodingAgent 的 prompt 要求根据字体可用性
+若系统无中文字体则输出警告。VizAgent 的 prompt 要求根据字体可用性
 决定使用中文或英文标签，避免出现方块乱码。
+
+### Web 搜索（题目背景知识）
+
+Layer 1 的 Decomposer 会自动对题目关键词联网搜索背景资料并注入上下文；
+Layer 3 的 SolverAgent 可自主调用 `web_search` 查询数据字段含义、算法资料。
+
+- **后端**：Tavily（免费 1000 次/月，推荐）或 ddgs（DuckDuckGo，免费无 key）
+- **配置**：`MATHMODELING_WEB_SEARCH_PROVIDER=auto|tavily|ddgs|off`（默认 `auto`：有 key 用 Tavily，否则 ddgs）
+- **容错**：10 秒超时、异常吞噬、tavily 失败自动降级 ddgs；搜索失败静默跳过，不影响主流程
 
 ### 全配置化
 
@@ -144,9 +154,9 @@ prefix caching 可以命中。动态值（路径、轮次、重试次数等）�
 ```
 
 - **L1/L2/L5**：传统 LLM 节点链（System Prompt → 单次调用 → 输出）
-- **L3 CodingAgent**：有 `run_code` / `read_file` / `write_file` / `list_dir` 工具的 Agentic 循环（写→跑→修，最多 30 轮）
+- **L3 SolverAgent**：有 `run_code` / `read_file` / `write_file` / `list_dir` / `web_search` 工具的 Agentic 循环（写→跑→修，最多 30 轮），VizAgent 负责图表生成
 - **L4 PaperAgent**：有 `read_file` / `list_dir` / `write_file` 工具的 Agentic 循环（逐节写→核实→改，最多 30 轮）
-- **总 Agent 数**：15（L1: 4, L2: 4, L3: 2, L4: 2, L5: 3）
+- **总 Agent 数**：16（L1: 4, L2: 4, L3: 3, L4: 2, L5: 3）
 
 ### 关键文件地图
 
@@ -157,6 +167,7 @@ prefix caching 可以命中。动态值（路径、轮次、重试次数等）�
 | `mathmodelingagents/agents/__init__.py` | Agent 工厂函数（含 Tool Calling 循环） | 修改 Agent 行为、添加工具 |
 | `mathmodelingagents/agents/utils/prompt_templates.py` | 全部 System Prompt（纯静态，可缓存） | 修改 Agent 指令 |
 | `mathmodelingagents/tools/__init__.py` | 沙盒执行 + LangChain Tool 封装 | 修改/添加工具 |
+| `mathmodelingagents/tools/web_search.py` | Web 搜索（Tavily / ddgs） | 修改搜索后端 |
 | `mathmodelingagents/llm_clients/__init__.py` | LLM 客户端 + 降级链 | 修改 API 调用逻辑 |
 | `mathmodelingagents/default_config.py` | 全局配置 + 模型路由 | 修改默认值、模型分配 |
 | `.env.example` | 环境变量说明 | 了解/修改用户配置项 |
@@ -214,7 +225,7 @@ python tests/test_api_connectivity.py
 
 | 模型 | 适用角色 | 特点 |
 |---|---|---|
-| `deepseek-v4-pro` | Manager、建模师、CodingAgent | 深度推理，复杂逻辑，工具调用 |
+| `deepseek-v4-pro` | Manager、建模师、SolverAgent | 深度推理，复杂逻辑，工具调用 |
 | `deepseek-v4-flash` | 数据分析、敏感性分析 | 快速响应，高性价比 |
 | `qwen3.7-max` | PaperAgent 论文正文撰写 | 中文写作质量高 |
 
@@ -237,6 +248,8 @@ python tests/test_api_connectivity.py
 | `MATHMODELING_MAX_IMPL_RETRIES` | `3` | 代码实现最大重试次数 |
 | `MATHMODELING_DEFAULT_MAX_TOKENS` | `16384` | 单次 LLM 调用最大输出 |
 | `MATHMODELING_SELECTED_LAYERS` | `1,2,3,4` | 要执行的层（调试时可用 `3,4` 跳层） |
+| `MATHMODELING_WEB_SEARCH_PROVIDER` | `auto` | Web 搜索后端：`auto`/`tavily`/`ddgs`/`off` |
+| `TAVILY_API_KEY` | (可选) | Tavily 搜索 key（不填则自动用 ddgs 免费后端） |
 
 ## 命令行
 
@@ -281,7 +294,8 @@ MathModelingAgents/
     │   └── __init__.py              # LLM 客户端 + 统一降级链
     │
     ├── tools/
-    │   └── __init__.py              # 沙盒代码执行 + LangChain Tool 封装
+    │   ├── __init__.py              # 沙盒代码执行 + LangChain Tool 封装
+    │   └── web_search.py            # Web 搜索（Tavily / ddgs）
     │
     ├── graph/
     │   ├── setup.py                 # LangGraph StateGraph 构建
@@ -299,6 +313,7 @@ MathModelingAgents/
 - **Tool Calling**：`langchain-core` — AIMessage / ToolMessage 工具调用协议
 - **模型**：DeepSeek V4 Pro / Flash、Qwen3.7-Max（通过 OpenCode Go 或官方 API）
 - **计算沙盒**：`numpy` · `scipy` · `sympy` · `pandas` · `matplotlib` · `seaborn` · `scikit-learn` · `statsmodels`
+- **Web 搜索**：Tavily（推荐） / ddgs（DuckDuckGo 免费后端）
 
 ## License
 

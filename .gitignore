@@ -13,7 +13,6 @@ dist/
 
 # 测试
 .pytest_cache/
-tests/
 
 # 运行时输出
 results/

@@ -57,6 +57,104 @@ def _extract_final_output(messages: list) -> str:
     return ""
 
 
+def _sanitize_tool_pairing(messages: list) -> list:
+    """清洗消息列表中的孤立 ToolMessage 和未完成的 tool_calls AIMessage。
+
+    处理两种截断导致的损坏场景：
+    1. ToolMessage 的前置 AIMessage(tool_calls) 被截断切掉 → 丢弃该 ToolMessage
+    2. AIMessage(tool_calls) 的对应 ToolMessage 被截断切掉 → 丢弃该 AIMessage
+       （含末尾未完成和中间缺失两种情况，避免 API 400）
+
+    采用计数法：对每条带 tool_calls 的 AIMessage，统计紧随其后的连续
+    ToolMessage 数量。若数量不足，丢弃 AIMessage 及所有残余 ToolMessage。
+    若 ToolMessage 超出 tool_calls 数量，多余 ToolMessage 视为孤立丢弃。
+    不依赖 tool_call_id 匹配，因截断后 ID 可能失效。
+
+    空列表安全返回；正常配对的 tool_calls/ToolMessage 序列原样保留。
+
+    Args:
+        messages: LangChain 消息列表。
+
+    Returns:
+        清洗后的消息列表（新列表，不修改原列表）。
+    """
+    if not messages:
+        return messages
+
+    cleaned: list = []
+    i = 0
+    n = len(messages)
+
+    while i < n:
+        msg = messages[i]
+        is_tool = getattr(msg, "type", "") == "tool"
+        tool_calls = getattr(msg, "tool_calls", None)
+
+        if is_tool:
+            # 孤立 ToolMessage：前面没有带 tool_calls 的 AIMessage
+            content = str(getattr(msg, "content", ""))[:80]
+            logger.warning(
+                "_sanitize_tool_pairing: 丢弃孤立 ToolMessage "
+                "(前一条消息无 tool_calls): %s",
+                content,
+            )
+            i += 1
+            continue
+
+        if tool_calls:
+            expected = len(tool_calls)
+            # 统计紧随其后的连续 ToolMessage 数量
+            actual = 0
+            j = i + 1
+            while j < n and getattr(messages[j], "type", "") == "tool":
+                actual += 1
+                j += 1
+
+            if actual == 0:
+                # 无任何 ToolMessage 跟随 → 丢弃此 AIMessage 避免 API 400
+                content = str(getattr(msg, "content", ""))[:80]
+                logger.warning(
+                    "_sanitize_tool_pairing: 丢弃 tool_calls AIMessage "
+                    "(无对应 ToolMessage): %s",
+                    content,
+                )
+                i += 1
+                continue
+
+            if actual < expected:
+                # ToolMessage 不足 → 丢弃 AIMessage + 所有残余 ToolMessage
+                logger.warning(
+                    "_sanitize_tool_pairing: 丢弃不完整 tool_calls "
+                    "AIMessage（期望 %d 个 ToolMessage，实际 %d 个）",
+                    expected, actual,
+                )
+                i = i + 1 + actual
+                continue
+
+            # actual >= expected：保留 AIMessage + 恰好 expected 个 ToolMessage
+            cleaned.append(msg)
+            for k in range(i + 1, i + 1 + expected):
+                cleaned.append(messages[k])
+
+            if actual > expected:
+                # 多余的 ToolMessage 视为孤立，逐条警告但已跳过
+                for k in range(i + 1 + expected, i + 1 + actual):
+                    orphan_content = str(getattr(messages[k], "content", ""))[:80]
+                    logger.warning(
+                        "_sanitize_tool_pairing: 丢弃多余 ToolMessage "
+                        "(tool_calls 仅 %d 个): %s",
+                        expected, orphan_content,
+                    )
+
+            i = i + 1 + actual
+            continue
+
+        cleaned.append(msg)
+        i += 1
+
+    return cleaned
+
+
 # ═══════════════════════════════════════════════════════════════════
 # ImplManager 文件扫描辅助 — 参考 TradingAgents Manager 模式：
 # 不依赖工具调用，在 LLM 调用前用 Python 扫描磁盘产出、
@@ -460,7 +558,40 @@ def _make_manager_node(
 # ═══════════════════════════════════════════════════════════════════
 
 def create_decomposer(config: dict) -> Callable[[AgentState], dict[str, Any]]:
-    return _make_llm_node(config, "decomposer", "problem", "agent", "problem_report")
+    def node_fn(state: AgentState) -> dict[str, Any]:
+        logger.info("[Layer1] Decomposer 执行中...")
+        max_tok = resolve_max_tokens(config, "agent", "decomposer")
+        system_prompt = get_prompt("decomposer") + "\n\n" + get_global_constraints()
+        context = _build_context(state, "problem", "decomposer", config)
+        user_msg = f"请根据以下上下文执行你的任务：\n\n{context}"
+
+        # ── 预搜索注入：题目背景知识（失败静默，不影响主流程）──
+        try:
+            problem_text = (state.get("problem_description") or "").strip()
+            if problem_text:
+                from mathmodelingagents.tools.web_search import web_search
+                search_result = web_search(problem_text[:150], max_results=3)
+                if not search_result.startswith("[搜索失败]") and not search_result.startswith("[搜索未启用]"):
+                    user_msg += "\n\n## 题目背景资料（自动搜索）\n\n" + search_result
+        except Exception as e:
+            logger.info("[Layer1] Decomposer 背景搜索跳过: %s", e)
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_msg),
+        ]
+        try:
+            result = invoke_with_fallback(config, "problem", "agent", messages, "decomposer", max_tokens=max_tok)
+        except Exception as e:
+            logger.error(f"[Layer1] decomposer 全部降级耗尽: {e}")
+            result = f"LLM 调用失败（全部降级耗尽）: {e}"
+        return {
+            "problem_report": result,
+            "layer_outputs": _record(state, "decomposer", "problem", "agent", 1, result),
+        }
+
+    node_fn.__name__ = "decomposer"
+    return node_fn
 
 
 def create_data_analyst(config: dict) -> Callable[[AgentState], dict[str, Any]]:
@@ -615,7 +746,7 @@ def create_solver_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
                     f"{len(existing)} → {len(truncated)} "
                     f"(保留首2+尾18)"
                 )
-                existing = truncated
+                existing = _sanitize_tool_pairing(truncated)
 
             logger.info(
                 f"[Layer3] SolverAgent RETRY 模式：继承 {len(existing)} 条消息，"
@@ -739,7 +870,7 @@ def create_solver_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
                     "3. 代码是否能成功执行？如果还有问题，列出未解决的部分。\n\n"
                     "请直接总结，不要调用工具。"
                 ))
-                summary_response = llm.invoke(messages + [summary_msg])
+                summary_response = llm.invoke(_sanitize_tool_pairing(messages) + [summary_msg])
                 summary_text = summary_response.content or ""
                 if summary_text:
                     final_output = summary_text
@@ -798,7 +929,7 @@ def create_viz_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
         if existing and "SELF_CHECK_PASSED" not in existing:
             # VizAgent RETRY: append feedback to continue fixing charts
             logger.info("[Layer3] VizAgent RETRY 模式：继承消息继续修复图表")
-            messages = (state.get("impl_messages") or []) + [
+            messages = _sanitize_tool_pairing(state.get("impl_messages") or []) + [
                 HumanMessage(content=(
                     f"## ⚠️ 上一轮图表生成未完成\n\n"
                     f"上一轮产出如下，请检查缺失的图表并补充生成：\n\n{existing}"
