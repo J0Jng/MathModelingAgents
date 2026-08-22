@@ -76,48 +76,38 @@ _RISKY_MODULES = {
 }
 
 
-def run_code(
-    code: str,
-    timeout: int = 30,
+def build_preamble(
+    blocked_modules: list[str] | set[str] | None = None,
     allowed_modules: list[str] | None = None,
-    cwd: str | None = None,
-) -> dict[str, Any]:
-    """Execute Python code in a sandboxed subprocess and return results.
+) -> str:
+    """Return the sandbox import-blocking preamble as a string.
 
-    The code runs in an isolated temporary directory by default. If *cwd* is
-    provided the script executes there instead, so files the code writes
-    (e.g. matplotlib charts) persist after the call.
-
-    Dangerous modules (os, subprocess, socket, etc.) are blocked via import
-    hook regardless of working directory.
+    Pure function — no subprocess, no network. The blocking policy is threaded
+    in as *data* so it can be audited and unit-tested in isolation.
 
     Args:
-        code: Python source code to execute.
-        timeout: Maximum execution time in seconds.
-        allowed_modules: Extra modules to allow (data-science stack is always
-            allowed). Defaults to numpy/scipy/pandas/matplotlib/sklearn/etc.
-        cwd: Optional working directory. When given, the script runs in this
-            directory and any files it creates survive the call.
+        blocked_modules: Roots that are ALWAYS rejected on import. Defaults to
+            ``_RISKY_MODULES``.
+        allowed_modules: Optional allowlist. When non-empty, any root not in it
+            is rejected on import (restrictive). Defaults to empty — meaning
+            *no* extra restriction, preserving the historical blocklist-only
+            sandbox.
 
-    Returns:
-        dict with keys:
-            stdout: Captured standard output (truncated at 10000 chars).
-            stderr: Captured standard error (truncated at 5000 chars).
-            exit_code: Process exit code (0 = success).
-            success: True if exit_code == 0.
-            execution_time: Wall-clock time in seconds.
+    Why the allowlist is opt-in by default: enforcing one by default (e.g.
+    ``DEFAULT_ALLOWED_MODULES``) would reject the stdlib/PIL/kiwisolver etc.
+    dependencies that generated solver code needs (matplotlib charts), changing
+    sandbox behaviour. See architecture-remediation brief (Ticket B) for the
+    recorded conflict.
     """
-    if allowed_modules is None:
-        allowed_modules = DEFAULT_ALLOWED_MODULES
+    block_set = set(_RISKY_MODULES if blocked_modules is None else blocked_modules)
+    allow_set = set(allowed_modules or [])
 
-    # Build preamble that restricts imports via a blocklist approach.
-    # We block dangerous modules; everything else (including Python internals
-    # like _io, _abc, encodings) is allowed so the runtime works correctly.
     preamble_lines = [
         "import sys",
         "import builtins",
         "# --- code sandbox preamble ---",
-        f"_blocked = {sorted(_RISKY_MODULES)!r}",
+        f"_blocked = {sorted(block_set)!r}",
+        f"_safe_allow = {sorted(allow_set)!r}",
         "# Snapshot of modules that were loaded before user code runs",
         "_preloaded = set(sys.modules.keys())",
         "_original_import = __import__",
@@ -125,7 +115,10 @@ def run_code(
         "    _root = name.split('.')[0]",
         "    # ALWAYS block risky modules — even if preloaded by the runtime",
         "    if _root in _blocked:",
-        f"        raise ImportError(f'Module {{name}} is blocked for security reasons')",
+        "        raise ImportError(f'Module {name} is blocked for security reasons')",
+        "    # Optional allowlist: when non-empty, only named roots may be imported",
+        "    if _safe_allow and _root not in _safe_allow:",
+        "        raise ImportError(f'Module {name} is not in the allowed set')",
         "    # Allow re-imports of safe modules that were already loaded at sandbox start",
         "    if name in _preloaded:",
         "        return _original_import(name, *args, **kwargs)",
@@ -168,7 +161,48 @@ def run_code(
         "# --- end preamble ---",
         "",
     ]
-    sandboxed_code = "\n".join(preamble_lines) + "\n" + code
+    return "\n".join(preamble_lines)
+
+
+def run_code(
+    code: str,
+    timeout: int = 30,
+    allowed_modules: list[str] | None = None,
+    cwd: str | None = None,
+) -> dict[str, Any]:
+    """Execute Python code in a sandboxed subprocess and return results.
+
+    The code runs in an isolated temporary directory by default. If *cwd* is
+    provided the script executes there instead, so files the code writes
+    (e.g. matplotlib charts) persist after the call.
+
+    Dangerous modules (os, subprocess, socket, etc.) are blocked via import
+    hook regardless of working directory.
+
+    Args:
+        code: Python source code to execute.
+        timeout: Maximum execution time in seconds.
+        allowed_modules: Optional extra allowlist. When given, only these roots
+            are importable inside the sandbox (restrictive). Defaults to None =
+            no extra restriction (blocklist-only). The data-science stack
+            (``DEFAULT_ALLOWED_MODULES``) is the reference set a caller may pass
+            to opt into: see ``build_preamble``.cwd: Optional working directory. When given, the script runs in this
+            directory and any files it creates survive the call.
+
+    Returns:
+        dict with keys:
+            stdout: Captured standard output (truncated at 10000 chars).
+            stderr: Captured standard error (truncated at 5000 chars).
+            exit_code: Process exit code (0 = success).
+            success: True if exit_code == 0.
+            execution_time: Wall-clock time in seconds.
+    """
+    # Build preamble via a pure, testable function — blocking policy as data.
+    # allowed_modules is threaded through (opt-in allowlist) but left as passed:
+    # default None → empty allow set → blocklist-only sandbox (unchanged).
+    # See build_preamble docstring for why we do NOT auto-enforce
+    # DEFAULT_ALLOWED_MODULES here (it would break the science-stack load).
+    sandboxed_code = build_preamble(allowed_modules=allowed_modules) + "\n" + code
 
     # ── persistent vs temp working directory ──
     if cwd:
