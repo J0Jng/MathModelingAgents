@@ -10,8 +10,35 @@ from typing import Any
 from langgraph.graph import END
 
 from mathmodelingagents.agents.utils.agent_states import AgentState
+from mathmodelingagents.default_config import resolve_sensitivity_mode
 
 logger = logging.getLogger(__name__)
+
+
+def sensitivity_active(config: dict, state: dict) -> bool:
+    """运行时敏感性闸门（ADR-0001/0002）：模式 × 敏感性决策 × 求解层前提。
+
+    真值表的唯一实现，ConditionalLogic 与 _build_context 共用：
+    - never 一律不启用；
+    - 求解层被跳过一律不启用（无 results.json 可扰动）；
+    - always 强制启用；
+    - auto 尊重 Layer 1 敏感性决策，缺省 fail-open 默认执行。
+
+    Args:
+        config: 全局配置字典（原始形态，旧键由 resolve_sensitivity_mode 迁移）。
+        state: 当前全局 AgentState。
+
+    Returns:
+        敏感性分析层是否将执行。
+    """
+    mode = resolve_sensitivity_mode(config)
+    if mode == "never":
+        return False
+    if 3 not in (config.get("selected_layers") or [1, 2, 3, 4]):
+        return False
+    if mode == "always":
+        return True
+    return bool(state.get("sensitivity_enabled", True))  # fail-open
 
 
 class ConditionalLogic:
@@ -36,6 +63,7 @@ class ConditionalLogic:
         max_risk_discuss_rounds: int = 10,
         max_impl_retries: int = 3,
         selected_layers: list[int] | None = None,
+        sensitivity_mode: str = "auto",
     ):
         """初始化路由逻辑。
 
@@ -47,6 +75,7 @@ class ConditionalLogic:
             max_risk_discuss_rounds: 风险讨论最大轮数。
             max_impl_retries: 实现重试最大次数。
             selected_layers: 用户选择的层列表，默认 [1,2,3,4]。
+            sensitivity_mode: 敏感性模式（auto/always/never，ADR-0001），默认 auto。
         """
         self.max_debate_rounds = max_debate_rounds  # deprecated
         self.max_problem_rounds = max_problem_rounds
@@ -55,6 +84,17 @@ class ConditionalLogic:
         self.max_risk_discuss_rounds = max_risk_discuss_rounds
         self.max_impl_retries = max_impl_retries
         self.selected_layers = selected_layers or [1, 2, 3, 4]
+        self.sensitivity_mode = sensitivity_mode
+
+    def _sensitivity_active(self, state: AgentState) -> bool:
+        """运行时敏感性闸门（真值表见 sensitivity_active，共用实现）。"""
+        return sensitivity_active(
+            {
+                "sensitivity_mode": self.sensitivity_mode,
+                "selected_layers": self.selected_layers,
+            },
+            state,
+        )
 
     # ═══════════════════════════════════════════════════════════════
     # Layer 1: Problem Analysis 路由
@@ -194,38 +234,43 @@ class ConditionalLogic:
         logger.info(f"Layer 4 论文通过 (decision={judge_decision}, round={round_count})")
         return "clear_paper"
 
-    def _route_after_paper(self, state: AgentState) -> str:
-        """clear_paper 后决定：进入 Layer 5 还是结束。"""
-        if 5 in self.selected_layers:
-            logger.info("Layer 4 → Layer 5: 进入敏感性分析")
-            return "sensitivity_scanner"
-        logger.info("Layer 4 完成，流程结束")
-        return END
-
     # ═══════════════════════════════════════════════════════════════
     # Layer 5: Sensitivity Analysis 路由
     # ═══════════════════════════════════════════════════════════════
 
     def should_continue_sensitivity(self, state: AgentState) -> str:
-        """Sensitivity 结束后：总是结束流程。
+        """Sensitivity 结束后：进入 Layer 4 论文写作或结束。
 
         Args:
             state: 当前全局 AgentState。
 
         Returns:
-            END。
+            "paper_agent" 进入论文层，或 END。
         """
+        if 4 in self.selected_layers:
+            logger.info("Layer 5 -> Layer 4: 敏感性分析完成，进入论文写作")
+            return "paper_agent"
         logger.info("Layer 5 敏感性分析完成，流程结束")
         return END
 
     def _route_after_impl(self, state: AgentState) -> str:
-        """clear_impl 后决定：进入 Layer 4 还是结束。"""
+        """clear_impl 后决定：敏感性分析（启用时前置）、论文写作或结束。
+
+        敏感性分析层前置于论文层（ADR-0002）：启用时 L3 -> L5 -> L4，
+        敏感性结果随跨层摘要进入论文层；禁用时 L3 -> L4 -> END。
+
+        Args:
+            state: 当前全局 AgentState。
+
+        Returns:
+            下一个节点名称或 END。
+        """
+        if self._sensitivity_active(state):
+            logger.info("Layer 3 -> Layer 5: 敏感性分析已启用，前置执行")
+            return "sensitivity_scanner"
         if 4 in self.selected_layers:
             logger.info("Layer 3 → Layer 4: 进入论文写作")
             return "paper_agent"
-        if 5 in self.selected_layers:
-            logger.info("Layer 3 → Layer 5: 进入敏感性分析")
-            return "sensitivity_scanner"
         logger.info("Layer 3 完成，流程结束")
         return END
 
@@ -248,10 +293,9 @@ class ConditionalLogic:
             2: "modeler_a",
             3: "solver_agent",
             4: "paper_agent",
-            5: "sensitivity_scanner",
         }
 
-        for layer in range(current_layer + 1, 6):
+        for layer in range(current_layer + 1, 5):
             if layer in self.selected_layers:
                 entry = layer_entry_map.get(layer)
                 if entry:

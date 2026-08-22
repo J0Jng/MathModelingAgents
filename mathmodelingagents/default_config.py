@@ -5,10 +5,43 @@
 """
 
 import json
+import logging
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
+_VALID_SENSITIVITY_MODES = ("auto", "always", "never")
+
+
+def resolve_sensitivity_mode(config: dict) -> str:
+    """归一化敏感性模式为三档 auto/always/never（ADR-0001）。
+
+    优先级：显式 sensitivity_mode > 旧布尔开关 true > 层选择含 5 > auto。
+    旧写法命中时打弃用警告；无效值回退到旧键检查，不崩溃。
+
+    Args:
+        config: 全局配置字典（原始形态，含可能的旧键）。
+
+    Returns:
+        "auto" / "always" / "never" 之一。
+    """
+    mode = str(config.get("sensitivity_mode") or "").strip().lower()
+    if mode in _VALID_SENSITIVITY_MODES:
+        return mode
+    if mode:
+        logger.warning(f"无效 sensitivity_mode={mode!r}，回退旧键检查")
+
+    if config.get("enable_sensitivity") is True:
+        logger.warning("enable_sensitivity 已退役：true 映射为 sensitivity_mode=always")
+        return "always"
+    if 5 in (config.get("selected_layers") or []):
+        logger.warning("selected_layers 含 5 已退役：映射为 sensitivity_mode=always")
+        return "always"
+    return "auto"
 
 
 def _env(key: str, default: str | None = None) -> str | None:
@@ -96,6 +129,21 @@ DEFAULT_CONFIG: dict = {
     "quick_think_llm": _env("quick_think_llm", "deepseek-v4-flash"),
     "layer_model_overrides": LAYER_MODEL_OVERRIDES,
 
+    # provider 级模型别名映射：某 provider 不支持的模型名 → 映射为可用模型。
+    # 例：volcengine 不支持 qwen3.7-max，自动映射为 deepseek-v4-pro。
+    "provider_model_aliases": {
+        "volcengine": {"qwen3.7-max": "deepseek-v4-pro"},
+        "volcengine-plan": {"qwen3.7-max": "minimax-m3"},
+    },
+
+    # provider 级角色模型覆盖：优先于全局 layer_model_overrides
+    "provider_layer_model_overrides": {
+        "volcengine-plan": {
+            "implementation": {"coder": "kimi-k2.7-code"},
+            "paper": {"writer": "minimax-m3"},
+        },
+    },
+
     # ═══════════════════════════════════════════════
     # 超时配置（每层，秒）— 不限时间，确保推理模型完整跑完
     # ═══════════════════════════════════════════════
@@ -134,7 +182,10 @@ DEFAULT_CONFIG: dict = {
     # ═══════════════════════════════════════════════
     # 层控制
     # ═══════════════════════════════════════════════
-    "enable_sensitivity": _env("enable_sensitivity", "false").lower() == "true",
+    # 敏感性模式（ADR-0001）：auto=Layer 1 决策（默认）/ always / never。
+    # 旧写法（enable_sensitivity / selected_layers 含 5）由 resolve_sensitivity_mode 迁移。
+    "sensitivity_mode": _env("sensitivity_mode", "auto"),
+    "enable_sensitivity": _env("enable_sensitivity", "false").lower() == "true",  # DEPRECATED
     "selected_layers": [
         int(s.strip())
         for s in _env("selected_layers", "1,2,3,4").split(",")

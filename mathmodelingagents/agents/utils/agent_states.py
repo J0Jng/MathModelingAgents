@@ -48,6 +48,8 @@ class AgentState(TypedDict, total=False):
     data_insights: str
     background_research: str        # Layer 1 自动搜索的题目背景资料（原始文本，供 Layer 2 注入）
     problem_messages: list
+    sensitivity_enabled: bool       # Layer 1 敏感性决策（ADR-0001）；缺省视为 True（fail-open）
+    sensitivity_reason: str         # 敏感性决策理由（随上下文注入 Layer 2/3，为扰动预留参数面）
 
     # ═══ Layer 2 产出 ═══
     model_debate_state: DebateState

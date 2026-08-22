@@ -1,7 +1,7 @@
 """[bold cyan]MathModelingAgents[/] — 多智能体数学建模竞赛框架
 
 Usage:
-    python main.py <题目文件路径> [--output <输出名>] [--sensitivity]
+    python main.py <题目文件路径> [--output <输出名>] [--sensitivity [auto|always|never]]
 """
 
 import sys
@@ -154,8 +154,11 @@ def main():
     )
     parser.add_argument(
         "--sensitivity", "-s",
-        action="store_true",
-        help="启用 Layer 5 敏感性分析",
+        nargs="?",
+        const="always",
+        choices=["auto", "always", "never"],
+        default=None,
+        help="敏感性模式 (默认: auto，由 Layer 1 分析题目后决策；裸 -s 等价 always)",
     )
     parser.add_argument(
         "--max-rounds", "-r",
@@ -166,7 +169,7 @@ def main():
     parser.add_argument(
         "--provider", "-p",
         default=None,
-        help="LLM provider (opencode/deepseek)",
+        help="LLM provider (opencode/deepseek/volcengine/volcengine-plan)",
     )
     parser.add_argument(
         "--start-layer",
@@ -191,11 +194,15 @@ def main():
     config["max_debate_rounds"] = args.max_rounds
     config["max_modeling_rounds"] = args.max_rounds
     config["max_revision_rounds"] = args.max_rounds
-    config["enable_sensitivity"] = args.sensitivity
+    if args.sensitivity:
+        config["sensitivity_mode"] = args.sensitivity
     config["selected_layers"] = list(range(args.start_layer, 5))
 
     # 输出名
     output_name = args.output or problem_path.stem
+
+    from mathmodelingagents.default_config import resolve_sensitivity_mode
+    sensitivity_mode = resolve_sensitivity_mode(config)
 
     print(f"""
 ╔══════════════════════════════════════════════╗
@@ -204,7 +211,7 @@ def main():
 ║  Provider:  {config['llm_provider']:<34}║
 ║  Problem:   {problem_path.name:<34}║
 ║  Output:    {output_name:<34}║
-║  Sensitivity: {'Yes' if config['enable_sensitivity'] else 'No':<33}║
+║  Sensitivity: {sensitivity_mode:<33}║
 ║  Max Rounds: {config['max_debate_rounds']:<33}║
 ╚══════════════════════════════════════════════╝
 """)

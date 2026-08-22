@@ -25,6 +25,7 @@ from mathmodelingagents.agents import (
     create_msg_delete,
 )
 from mathmodelingagents.graph.conditional_logic import ConditionalLogic
+from mathmodelingagents.default_config import resolve_sensitivity_mode
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +37,9 @@ class GraphSetup:
     - Layer 1: Decomposer → DataAnalyst → ConstraintAnalyst → ProblemManager → 路由
     - Layer 2: ModelerA → ModelerB → ModelerC → ModelingManager → 辩论路由
     - Layer 3: SolverAgent → ImplManager → 重试路由 → VizAgent → clear_impl → 路由
-    - Layer 4: PaperAgent → PaperManager → 修改路由
-    - Layer 5: ParamPerturber → RobustnessAnalyst → SensitivityManager → END
+    - Layer 4: PaperAgent → PaperManager → 修改路由 → END（最终层）
+    - Layer 5: ParamPerturber → RobustnessAnalyst → SensitivityManager → 论文层
+      （条件前置层，ADR-0002：启用时 L3 → L5 → L4，禁用时跳过）
     """
 
     def __init__(self, config: dict):
@@ -48,7 +50,11 @@ class GraphSetup:
         """
         self.config = config
         self.max_debate_rounds = config.get("max_debate_rounds", 10)
+        # 保留原始 selected_layers（Layer 5 已退役，由 sensitivity_mode 接管；
+        # 是否含 5 由 resolve_sensitivity_mode 统一处理，这里不再过滤，保证
+        # 守卫 sensitivity_active 在路由与上下文注入两处读到的 config 形态一致）
         self.selected_layers = config.get("selected_layers", [1, 2, 3, 4])
+        self.sensitivity_mode = resolve_sensitivity_mode(config)
 
         # 创建所有 Agent 节点
         self._create_agent_nodes()
@@ -61,6 +67,7 @@ class GraphSetup:
             max_revision_rounds=config.get("max_revision_rounds", 8),
             max_impl_retries=config.get("max_impl_retries", 3),
             selected_layers=self.selected_layers,
+            sensitivity_mode=self.sensitivity_mode,
         )
 
     def _create_agent_nodes(self):
@@ -117,13 +124,15 @@ class GraphSetup:
             → (RETRY) → solver_agent
             → (CONCLUDE) → viz_agent → clear_impl → next_layer
 
-        Layer 4 的流转（修改循环）：
+        Layer 4 的流转（修改循环，最终层）：
             paper_agent → paper_manager
             → (REVISE) → paper_agent
-            → (CONCLUDE) → clear_paper → next_layer
+            → (CONCLUDE) → clear_paper → END
 
-        Layer 5 的流转：
-            param_perturber → robustness_analyst → sensitivity_manager → END
+        Layer 5 的流转（条件前置层，启用时插在论文层之前，ADR-0002）：
+            param_perturber → robustness_analyst → sensitivity_manager
+            → (Layer 4 启用) → paper_agent
+            → (否则) → END
 
         Returns:
             未编译的 StateGraph（调用 .compile() 后获得可执行的 graph）。
@@ -180,9 +189,7 @@ class GraphSetup:
         workflow.add_node("clear_paper", self.clear_paper)
 
     def _add_layer5_nodes(self, workflow: StateGraph):
-        """添加 Layer 5 节点（仅当启用时）。"""
-        if 5 not in self.selected_layers:
-            return
+        """添加 Layer 5 节点（无条件构建，启用与否由运行时路由决定，ADR-0001）。"""
         workflow.add_node("param_perturber", self.param_perturber)
         workflow.add_node("robustness_analyst", self.robustness_analyst)
         workflow.add_node("sensitivity_manager", self.sensitivity_manager)
@@ -201,7 +208,6 @@ class GraphSetup:
             2: "modeler_a",
             3: "solver_agent",
             4: "paper_agent",
-            5: "param_perturber",
         }.get(first_layer, "decomposer")
 
         workflow.add_edge(START, first_entry)
@@ -267,21 +273,21 @@ class GraphSetup:
                     "clear_paper": "clear_paper",
                 },
             )
-            workflow.add_conditional_edges(
-                "clear_paper",
-                self.conditional_logic._route_after_paper,
-                self._get_layer4_destinations(),
-            )
+            # 论文层为最终层（ADR-0002：敏感性分析已前置于论文层），直接结束
+            workflow.add_edge("clear_paper", END)
 
         # ── Layer 5: 顺序连接 ──
-        if 5 in self.selected_layers:
-            workflow.add_edge("param_perturber", "robustness_analyst")
-            workflow.add_edge("robustness_analyst", "sensitivity_manager")
-            workflow.add_conditional_edges(
-                "sensitivity_manager",
-                self.conditional_logic.should_continue_sensitivity,
-                {"__end__": END},
-            )
+        # ── Layer 5: 顺序连接（无条件构建，ADR-0001；启用时 L3 -> L5 -> L4，ADR-0002）──
+        workflow.add_edge("param_perturber", "robustness_analyst")
+        workflow.add_edge("robustness_analyst", "sensitivity_manager")
+        l5_dests: dict = {"__end__": END}
+        if 4 in self.selected_layers:
+            l5_dests["paper_agent"] = "paper_agent"
+        workflow.add_conditional_edges(
+            "sensitivity_manager",
+            self.conditional_logic.should_continue_sensitivity,
+            l5_dests,
+        )
 
     # ═══════════════════════════════════════════
     # 路由目标映射
@@ -296,8 +302,6 @@ class GraphSetup:
             dests["solver_agent"] = "solver_agent"
         if 4 in self.selected_layers:
             dests["paper_agent"] = "paper_agent"
-        if 5 in self.selected_layers:
-            dests["sensitivity_scanner"] = "param_perturber"
         dests[END] = END
         return dests
 
@@ -308,25 +312,14 @@ class GraphSetup:
             dests["solver_agent"] = "solver_agent"
         if 4 in self.selected_layers:
             dests["paper_agent"] = "paper_agent"
-        if 5 in self.selected_layers:
-            dests["sensitivity_scanner"] = "param_perturber"
         dests[END] = END
         return dests
 
     def _get_layer3_destinations(self) -> dict:
-        """Layer 3 完成后的目标映射（clear_impl → 下一层，动态）。"""
+        """Layer 3 完成后的目标映射（clear_impl -> 敏感性分析或论文层，动态）。"""
         dests: dict = {}
         if 4 in self.selected_layers:
             dests["paper_agent"] = "paper_agent"
-        if 5 in self.selected_layers:
-            dests["sensitivity_scanner"] = "param_perturber"
-        dests[END] = END
-        return dests
-
-    def _get_layer4_destinations(self) -> dict:
-        """Layer 4 完成后的目标映射（动态）。"""
-        dests: dict = {}
-        if 5 in self.selected_layers:
-            dests["sensitivity_scanner"] = "param_perturber"
+        dests["sensitivity_scanner"] = "param_perturber"  # 启用时前置（ADR-0002）
         dests[END] = END
         return dests

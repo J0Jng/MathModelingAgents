@@ -14,6 +14,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from mathmodelingagents.agents.utils.agent_states import AgentState
 from mathmodelingagents.agents.utils.prompt_templates import get_prompt, get_global_constraints
 from mathmodelingagents.llm_clients import invoke_with_fallback, resolve_max_tokens, is_retryable_error, create_layer_llm
+from mathmodelingagents.default_config import resolve_sensitivity_mode
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,50 @@ def _record(state: AgentState, agent: str, layer: str, role: str,
         "output": output,
     })
     return records
+
+
+def _run_sensitivity_decision(config: dict, problem_report: str) -> tuple[bool, str]:
+    """Layer 1 敏感性决策（ADR-0001）：结构化 LLM 调用判定本题是否需要敏感性分析。
+
+    ProblemManager 裁决 CONCLUDE 后调用，使用 problem 层 manager 档模型 +
+    function calling（with_structured_output），Manager 本体保持无工具。
+    任何异常（含结构化输出形状异常）fail-open 默认执行。
+
+    Args:
+        config: 全局配置。
+        problem_report: ProblemManager 的最终裁决文本（含完整问题分析）。
+
+    Returns:
+        (enabled, reason) 二元组。
+    """
+    from pydantic import BaseModel, Field
+
+    class SensitivityDecision(BaseModel):
+        """敏感性决策结构化 schema。"""
+        enabled: bool = Field(description="本题是否需要敏感性分析")
+        reason: str = Field(description="一两句判断理由：题目是否存在值得扰动检验的关键参数、权重或不确定假设")
+
+    try:
+        # 温度不显式传：manager 角色由 temperature_overrides 解析为 0.1（低温），
+        # 避免绕过配置链
+        llm = create_layer_llm(config, "problem", "manager", max_tokens=1024)
+        structured = llm.with_structured_output(SensitivityDecision)
+        decision = structured.invoke([
+            SystemMessage(content=(
+                "你是数学建模竞赛的评审专家。根据题目分析报告，判断本题是否需要敏感性分析"
+                "（灵敏度分析）：题目是否存在值得扰动检验的关键参数、权重或不确定假设。"
+                "通常含优化参数、预测模型或权重设定的问题需要；"
+                "纯描述统计或数据呈现类问题不需要。"
+            )),
+            HumanMessage(content=f"## 题目分析报告\n\n{problem_report}\n\n请给出敏感性决策。"),
+        ])
+        enabled = bool(decision.enabled)
+        reason = str(getattr(decision, "reason", "") or "").strip() or "（未给出理由）"
+        logger.info(f"[problem] 敏感性决策: {'启用' if enabled else '跳过'} - {reason}")
+        return enabled, reason
+    except Exception as e:
+        logger.warning(f"[problem] 敏感性决策调用失败，fail-open 默认执行: {e}")
+        return True, f"决策调用失败（{e}），fail-open 默认执行"
 
 
 def _extract_final_output(messages: list) -> str:
@@ -357,6 +402,24 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
         if state.get("sensitivity_report"):
             parts.append(f"## 敏感性报告\n\n{state['sensitivity_report']}")
 
+    # ── 敏感性分析计划（ADR-0001）：决策+理由注入建模/实现层，为扰动预留参数面 ──
+    if layer in ("modeling", "implementation"):
+        from mathmodelingagents.graph.conditional_logic import sensitivity_active
+        reason = state.get("sensitivity_reason", "")
+        if sensitivity_active(config, state):
+            parts.append(
+                "## 敏感性分析计划\n\n"
+                "本题将进行敏感性分析（灵敏度分析）。请在建模和实现中将关键参数"
+                "显式化为可调输入，并在求解结果中结构化输出参数取值，"
+                "以便后续扰动检验结论稳健性。"
+                + (f"\n\nLayer 1 决策理由：{reason}" if reason else "")
+            )
+        else:
+            parts.append(
+                "## 敏感性分析计划\n\n本题不进行敏感性分析。"
+                + (f"\n\nLayer 1 决策理由：{reason}" if reason else "")
+            )
+
     # 元信息
     debate = state.get("model_debate_state", {})
     round_info = debate.get("round_count", 0)
@@ -364,13 +427,14 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
     remaining = max(0, max_rounds - round_info)
     current_layer_info = state.get('current_layer', layer)
     output_dir = config.get("output_dir", "output")
+    from mathmodelingagents.default_config import resolve_sensitivity_mode
     parts.append(
         f"## 当前状态\n"
         f"- 当前层: {current_layer_info}\n"
         f"- 输出目录: {output_dir}\n"
         f"- 辩论轮次: {round_info}/{max_rounds} (剩余 {remaining} 轮)\n"
         f"- 实现重试次数: {state.get('impl_retry_count', 0)}\n"
-        f"- 敏感性分析: {'已启用' if config.get('enable_sensitivity') else '未启用'}"
+        f"- 敏感性模式: {resolve_sensitivity_mode(config)}"
     )
 
     return "\n\n---\n\n".join(parts)
@@ -527,6 +591,14 @@ def _make_manager_node(
                 logger.info(f"[{layer}] 层摘要已提取 ({len(summary_text)} 字符)")
             else:
                 logger.warning(f"[{layer}] 未在 Manager 输出中找到 ## 层摘要 标记")
+
+            # ── Layer 1 敏感性决策（ADR-0001）：CONCLUDE 后结构化调用 ──
+            # 仅 auto 模式需要该决策；always/never 由模式直接接管，避免白跑一次 LLM
+            if layer == "problem" and resolve_sensitivity_mode(config) == "auto":
+                enabled, reason = _run_sensitivity_decision(config, result)
+                updates["sensitivity_enabled"] = enabled
+                updates["sensitivity_reason"] = reason
+                print(f"[problem] 敏感性决策: {'✅ 启用' if enabled else '⏭️ 跳过'} - {reason}", flush=True)
 
         # 根据层写入特定字段
         if layer == "problem":
