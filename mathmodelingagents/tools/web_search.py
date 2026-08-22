@@ -35,13 +35,38 @@ _TIMEOUT = 10  # seconds
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _get_provider() -> str:
+def resolve_tavily_key(config: dict | None = None) -> str | None:
+    """Return the Tavily API key: config first, env fallback.
+
+    Args:
+        config: Optional config dict with a `tavily_api_key` key.
+
+    Returns:
+        The API key string, or None if not configured.
+    """
+    if config and config.get("tavily_api_key"):
+        return config["tavily_api_key"]
+    return os.getenv("MATHMODELING_TAVILY_API_KEY") or os.getenv("TAVILY_API_KEY")
+
+
+def resolve_provider(config: dict | None = None) -> str:
     """Resolve the effective web search provider.
+
+    Provider decision lives in one place. Reads `config["web_search_provider"]`
+    first, then env `MATHMODELING_WEB_SEARCH_PROVIDER`, then defaults to "auto".
+
+    Args:
+        config: Optional config dict with a `web_search_provider` key.
 
     Returns:
         One of "tavily", "ddgs", or "off".
     """
-    provider = (os.getenv("MATHMODELING_WEB_SEARCH_PROVIDER") or "auto").strip().lower()
+    provider = (
+        (config or {}).get("web_search_provider")
+        or os.getenv("MATHMODELING_WEB_SEARCH_PROVIDER")
+        or "auto"
+    )
+    provider = (str(provider)).strip().lower()
 
     if provider == "off":
         return "off"
@@ -53,21 +78,34 @@ def _get_provider() -> str:
         return "ddgs"
 
     if provider == "auto":
-        if os.getenv("TAVILY_API_KEY") or os.getenv("MATHMODELING_TAVILY_API_KEY"):
+        if resolve_tavily_key(config):
             return "tavily"
         return "ddgs"
 
     # Unknown value → warn and treat as off
     logger.warning(
-        "未知 MATHMODELING_WEB_SEARCH_PROVIDER=%s，已禁用搜索。有效值: auto | tavily | ddgs | off",
+        "未知 web_search_provider=%s，已禁用搜索。有效值: auto | tavily | ddgs | off",
         provider,
     )
     return "off"
 
 
+def _get_provider() -> str:
+    """Resolve the effective web search provider (thin helper, env-driven).
+
+    Retained for backward compatibility. New callers should use
+    :func:`resolve_provider`.
+    """
+    return resolve_provider()
+
+
 def _get_tavily_key() -> str | None:
-    """Return the Tavily API key from env, if any."""
-    return os.getenv("MATHMODELING_TAVILY_API_KEY") or os.getenv("TAVILY_API_KEY")
+    """Return the Tavily API key from env (thin helper).
+
+    Retained for backward compatibility. New callers should use
+    :func:`resolve_tavily_key`.
+    """
+    return resolve_tavily_key()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -75,17 +113,18 @@ def _get_tavily_key() -> str | None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _search_tavily(query: str, max_results: int = 5) -> list[dict]:
+def _search_tavily(query: str, max_results: int = 5, api_key: str | None = None) -> list[dict]:
     """Search via Tavily API.
 
     Args:
         query: Search query string.
         max_results: Max number of results to return.
+        api_key: Tavily API key (from config when given; env otherwise).
 
     Returns:
         List of dicts with keys: title, url, content.
     """
-    api_key = _get_tavily_key()
+    api_key = api_key or resolve_tavily_key()
     if not api_key:
         raise ValueError("TAVILY_API_KEY 未设置")
 
@@ -209,22 +248,24 @@ def _truncate_error(e: Exception) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def web_search(query: str, max_results: int = 5) -> str:
+def web_search(query: str, max_results: int = 5, config: dict | None = None) -> str:
     """Search the web and return formatted results.
 
     Args:
         query: Search query string.
         max_results: Max number of results (default 5).
+        config: Optional config dict with `web_search_provider` / `tavily_api_key`
+            keys. Overrides env when present.
 
     Returns:
         Formatted search results string, or "[搜索失败] …" / "[搜索未启用] …".
     """
-    provider = _get_provider()
+    provider = resolve_provider(config)
 
     if provider == "off":
         return (
             "[搜索未启用] 搜索功能当前已关闭。"
-            "如需启用请设置环境变量 MATHMODELING_WEB_SEARCH_PROVIDER（auto | tavily | ddgs）"
+            "如需启用请设置 web_search_provider（auto | tavily | ddgs）"
         )
 
     logger.info("web_search: query=%r, provider=%s, max_results=%d", query, provider, max_results)
@@ -232,10 +273,11 @@ def web_search(query: str, max_results: int = 5) -> str:
     # ── Primary search ──
     results: list[dict] = []
     error_summary: str | None = None
+    api_key = resolve_tavily_key(config)
 
     try:
         if provider == "tavily":
-            results = _search_tavily(query, max_results)
+            results = _search_tavily(query, max_results, api_key=api_key)
         else:
             results = _search_ddgs(query, max_results)
     except Exception as e:
@@ -263,7 +305,7 @@ def web_search(query: str, max_results: int = 5) -> str:
     # ── No results after all attempts ──
     if not results:
         # ddgs not installed but provider=ddgs (or was the fallback)
-        if error_summary is None and (provider == "ddgs" or _get_provider() == "ddgs"):
+        if error_summary is None and (provider == "ddgs" or resolve_provider(config) == "ddgs"):
             error_summary = "ddgs: 库未安装，请运行 pip install duckduckgo-search"
         return f"[搜索失败] {error_summary or '未知错误'}"
 

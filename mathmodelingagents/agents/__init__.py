@@ -15,6 +15,7 @@ from mathmodelingagents.agents.utils.agent_states import AgentState
 from mathmodelingagents.agents.utils.prompt_templates import get_prompt, get_global_constraints
 from mathmodelingagents.llm_clients import invoke_with_fallback, resolve_max_tokens, is_retryable_error, create_layer_llm
 from mathmodelingagents.default_config import resolve_sensitivity_mode
+from mathmodelingagents.tools.web_search import web_search
 
 logger = logging.getLogger(__name__)
 
@@ -640,31 +641,29 @@ def create_decomposer(config: dict) -> Callable[[AgentState], dict[str, Any]]:
         user_msg = f"请根据以下上下文执行你的任务：\n\n{context}"
 
         # ── 预搜索注入：题目背景知识（失败静默，不影响主流程）──
+        # web_search 模块内部统一吞错并返回 [搜索失败] 文案（不 raise），
+        # 这里只检查前缀，不再两层 try/except 吞错。
         search_combined = ""
-        try:
-            from mathmodelingagents.tools.web_search import web_search
-            problem_text = (state.get("problem_description") or "").strip()
-            if problem_text:
-                parts_search = []
+        problem_text = (state.get("problem_description") or "").strip()
+        if problem_text:
+            parts_search = []
 
-                # 查询 1: 题目背景（题目前 150 字符）
-                r1 = web_search(problem_text[:150], max_results=5)
-                if not r1.startswith("[搜索失败]") and not r1.startswith("[搜索未启用]"):
-                    parts_search.append(f"### 查询 1（题目背景）\n{r1}")
+            # 查询 1: 题目背景（题目前 150 字符）
+            r1 = web_search(problem_text[:150], max_results=5, config=config)
+            if not r1.startswith("[搜索失败]") and not r1.startswith("[搜索未启用]"):
+                parts_search.append(f"### 查询 1（题目背景）\n{r1}")
 
-                # 查询 2: 建模方法参考（题目首行 + " 数学建模"）
-                first_line = problem_text.split("\n")[0].strip()
-                if len(first_line) >= 10:
-                    q2 = (first_line[:80] + " 数学建模").strip()
-                    r2 = web_search(q2, max_results=3)
-                    if not r2.startswith("[搜索失败]") and not r2.startswith("[搜索未启用]"):
-                        parts_search.append(f"### 查询 2（建模方法参考）\n{r2}")
+            # 查询 2: 建模方法参考（题目首行 + " 数学建模"）
+            first_line = problem_text.split("\n")[0].strip()
+            if len(first_line) >= 10:
+                q2 = (first_line[:80] + " 数学建模").strip()
+                r2 = web_search(q2, max_results=3, config=config)
+                if not r2.startswith("[搜索失败]") and not r2.startswith("[搜索未启用]"):
+                    parts_search.append(f"### 查询 2（建模方法参考）\n{r2}")
 
-                if parts_search:
-                    search_combined = "\n\n".join(parts_search)
-                    user_msg += "\n\n## 题目背景资料（自动搜索）\n\n" + search_combined
-        except Exception as e:
-            logger.info("[Layer1] Decomposer 背景搜索跳过: %s", e)
+            if parts_search:
+                search_combined = "\n\n".join(parts_search)
+                user_msg += "\n\n## 题目背景资料（自动搜索）\n\n" + search_combined
 
         messages = [
             SystemMessage(content=system_prompt),
