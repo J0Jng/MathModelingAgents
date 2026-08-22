@@ -7,7 +7,8 @@ Multi-agent mathematical modeling framework using LangGraph. 5-layer architectur
 - Layer 2: Mathematical Modeling (ModelerA → ModelerB → ModelerC → ModelingManager, debate loop, 4 agents)
 - Layer 3: Code Implementation (SolverAgent → ImplManager → VizAgent, retry loop + visualization, 3 agents)
 - Layer 4: Paper Writing (PaperAgent → PaperManager, agentic section-by-section loop, 2 agents)
-- Layer 5: Sensitivity Analysis (optional, 3 agents)
+- Layer 5: Sensitivity Analysis (conditional pre-paper layer, 3 agents)
+- Layer 5 enablement: runtime decision by Layer 1 (ProblemManager CONCLUDE → structured `sensitivity_enabled` call), governed by `sensitivity_mode` (auto/always/never). When enabled runs L3 → L5 → L4 so sensitivity results reach the paper (ADR-0001/0002). Requires Layer 3 outputs; skipped when Layer 3 is skipped.
 
 Total: 16 agents (down from 19 — Layers 3 and 4 merged from 3-agent chains; Layer 3 split into Solver+Viz)
 
@@ -63,6 +64,7 @@ Total: 16 agents (down from 19 — Layers 3 and 4 merged from 3-agent chains; La
 - Max_tokens_overrides: agent_name priority > role > default (1024)
 - Temperature_overrides: role > default (0.0)
 - All layers timeout: 10800s (3 hours)
+- Sensitivity mode: `sensitivity_mode` = auto (default, governed by Layer 1) / always / never; legacy `enable_sensitivity` boolean and `selected_layers` containing 5 map to always with a deprecation warning (see `resolve_sensitivity_mode`)
 - **Unified fallback chain** (`invoke_with_fallback` in `llm_clients/__init__.py`):
   1. Primary provider + role model (e.g. opencode + deepseek-v4-pro)
   2. Fallback provider (deepseek official API) + same model name

@@ -1,6 +1,12 @@
-"""LLM Client Factory — 支持 OpenCode Go 和 DeepSeek。
+"""LLM Client Factory — 支持 OpenCode Go、DeepSeek 和火山方舟两种订阅套餐。
 
 使用 langchain-openai 的 ChatOpenAI，避免直接 import openai。
+
+支持的 provider：
+  - "opencode"           OpenCode Go 网关
+  - "deepseek"            DeepSeek 官方 API
+  - "volcengine"          火山方舟 **Coding Plan**（`api/coding/v3`，`VOLCENGINE_API_KEY`）
+  - "volcengine-plan"     火山方舟 **Agent Plan**（`api/plan/v3`，`VOLCENGINE_PLAN_API_KEY`）
 
 Timeout 策略（从 config.layer_timeouts 读取，统一 10800s = 3h）：
   - 不限时间，确保推理模型能完整跑完
@@ -117,7 +123,8 @@ def create_llm_client(
     """创建 LLM 客户端。
 
     Args:
-        provider: "opencode" 或 "deepseek"
+        provider: "opencode" / "deepseek"
+                  "volcengine"（火山方舟 Coding Plan）/"volcengine-plan"（火山方舟 Agent Plan）
         model: 模型名称
         base_url: 自定义 API 地址
         temperature: 温度参数
@@ -141,8 +148,27 @@ def create_llm_client(
         if not api_key:
             raise ValueError("DEEPSEEK_API_KEY 环境变量未设置")
         url = base_url or "https://api.deepseek.com/v1"
+    elif provider == "volcengine":
+        # 火山方舟 Coding Plan（普通方舟 Key）
+        api_key = os.getenv("VOLCENGINE_API_KEY", "")
+        if not api_key:
+            raise ValueError("VOLCENGINE_API_KEY 环境变量未设置")
+        url = base_url or "https://ark.cn-beijing.volces.com/api/coding/v3"
+    elif provider == "volcengine-plan":
+        # 火山方舟 Agent Plan（订阅后从「开通管理」换取专属 Key）
+        api_key = os.getenv("VOLCENGINE_PLAN_API_KEY") or os.getenv("VOLCENGINE_API_KEY", "")
+        if not api_key:
+            raise ValueError("VOLCENGINE_PLAN_API_KEY / VOLCENGINE_API_KEY 环境变量未设置")
+        url = base_url or "https://ark.cn-beijing.volces.com/api/plan/v3"
     else:
         raise ValueError(f"不支持的 LLM provider: {provider}")
+
+    # volcengine-plan（Agent Plan）端点上 max_completion_tokens 是推理+正文总预算，
+    # 推理模型会吃满预算导致正文返空（langchain 强制的参数名语义）。
+    # 显式指定 reasoning_effort 压制推理暴走（已实测验证）。
+    # 注意：langchain-openai 1.4.x 将 reasoning_effort 作为显式参数，
+    # 传入 model_kwargs 会被提升为显式字段并触发 UserWarning，故直接传显式参数。
+    reasoning_effort = "medium" if provider == "volcengine-plan" else None
 
     logger.info(
         f"创建 LLM: provider={provider}, model={model}, "
@@ -157,7 +183,15 @@ def create_llm_client(
         max_tokens=max_tokens,
         request_timeout=request_timeout,
         max_retries=2,
+        reasoning_effort=reasoning_effort,
     )
+
+
+def _apply_model_alias(config: dict, provider: str, model: str) -> str:
+    """应用 provider 级模型别名映射（如 volcengine 下 qwen3.7-max → deepseek-v4-pro）。"""
+    aliases = config.get("provider_model_aliases", {})
+    provider_aliases = aliases.get(provider, {})
+    return provider_aliases.get(model, model)
 
 
 def get_layer_model(
@@ -179,18 +213,24 @@ def get_layer_model(
 
     if provider == "deepseek":
         if role == "manager":
-            return config["deep_think_llm"]
-        return config["quick_think_llm"]
+            model = config["deep_think_llm"]
+        else:
+            model = config["quick_think_llm"]
+    else:
+        # OpenCode / volcengine / volcengine-plan 模式：查 layer_model_overrides
+        overrides = config.get("layer_model_overrides", {})
+        # 1) provider 级 layer 覆盖优先（合并：全局为底，provider 级覆盖同名角色）
+        pv_overrides = config.get("provider_layer_model_overrides", {}).get(provider, {})
+        layer_config = {**overrides.get(layer, {}), **pv_overrides.get(layer, {})}
 
-    # OpenCode 模式：查 layer_model_overrides
-    overrides = config.get("layer_model_overrides", {})
-    layer_config = overrides.get(layer, {})
+        if role in layer_config:
+            model = layer_config[role]
+        elif "agent" in layer_config:
+            model = layer_config["agent"]
+        else:
+            model = config["quick_think_llm"]
 
-    if role in layer_config:
-        return layer_config[role]
-    if "agent" in layer_config:
-        return layer_config["agent"]
-    return config["quick_think_llm"]
+    return _apply_model_alias(config, provider, model)
 
 
 def create_layer_llm(

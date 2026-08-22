@@ -185,6 +185,12 @@ python main.py problem_2024a.md --start-layer 3
 # 只用 DeepSeek 官方 API
 python main.py problem_2024a.md --provider deepseek
 
+# 用火山方舟 Agent Plan（订阅套餐，L3 coder→kimi-k2.7-code，L4 writer→minimax-m3）
+python main.py problem_2024a.md --provider volcengine-plan
+
+# 用火山方舟 Coding Plan（订阅套餐，qwen3.7-max 自动映射为 deepseek-v4-pro）
+python main.py problem_2024a.md --provider volcengine
+
 # 启用敏感性分析
 python main.py problem_2024a.md -s
 ```
@@ -223,17 +229,35 @@ python tests/test_api_connectivity.py
 
 ## 支持模型
 
+### opencode / deepseek 通道（默认）
+
 | 模型 | 适用角色 | 特点 |
 |---|---|---|
 | `deepseek-v4-pro` | Manager、建模师、SolverAgent | 深度推理，复杂逻辑，工具调用 |
 | `deepseek-v4-flash` | 数据分析、敏感性分析 | 快速响应，高性价比 |
-| `qwen3.7-max` | PaperAgent 论文正文撰写 | 中文写作质量高 |
+| `qwen3.7-max` | PaperAgent 论文正文撰写（仅 opencode 通道） | 中文写作质量高 |
 
-### 已知不可用模型
+### 火山方舟 Agent Plan 通道（`--provider volcengine-plan`）
 
-以下模型在长中文数学建模 prompt 下会返回空内容，已被框架排除：
+Provider 级角色覆盖（`provider_layer_model_overrides`），优先于全局分配：
 
-- `kimi-k2.7-code` · `glm-5.2` · `glm-5.1`
+| 角色 | 模型 | 说明 |
+|---|---|---|
+| L3 coder | `kimi-k2.7-code` | 火山主打编程模型 |
+| L4 writer | `minimax-m3` | 1M 上下文，长文写作 |
+| 其余角色 | `deepseek-v4-pro` / `deepseek-v4-flash` | 沿用默认矩阵 |
+
+Agent Plan 模型池（11 个）：`ark-code-latest`、`doubao-seed-2.1-turbo`、`doubao-seed-evolving`、`glm-5.3/latest`、`deepseek-v4-pro/flash`、`doubao-seed-2.0-lite/mini`、`minimax-m3`、`kimi-k2.7-code`、`kimi-k3`。
+
+### 火山方舟 Coding Plan 通道（`--provider volcengine`）
+
+- Base URL 为 `https://ark.cn-beijing.volces.com/api/coding/v3`（与 Agent Plan 的 `/api/plan/v3` 不同端点）。
+- 火山两个套餐均不支持 `qwen3.7-max`，自动映射（Coding Plan → `deepseek-v4-pro`，Agent Plan → `minimax-m3`）。
+
+### 已知不可用 / 风险提示
+
+- `glm-5.2` · `glm-5.1` 在 opencode 通道的长中文数学建模 prompt 下会返回空内容，已被排除。
+- `kimi-k2.7-code` 在 **OpenCode Go 后端**曾因长 prompt 返空被移除，且只接受 `temperature=1`；本次在 **volcengine-plan 通道**重新启用为 L3 coder（火山原生端点行为不同），正式跑题前请先用 `scripts/probe_model_quality.py` 实测输出质量。
 
 ## 配置
 
@@ -241,9 +265,10 @@ python tests/test_api_connectivity.py
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `MATHMODELING_LLM_PROVIDER` | `opencode` | LLM 通道：`opencode` 或 `deepseek` |
+| `MATHMODELING_LLM_PROVIDER` | `opencode` | LLM 通道：`opencode` / `deepseek` / `volcengine` / `volcengine-plan` |
 | `OPENCODE_GO_API_KEY` | (必填) | OpenCode Go API 密钥（主通道） |
 | `DEEPSEEK_API_KEY` | (必填) | DeepSeek 官方 API 密钥（降级通道） |
+| `VOLCENGINE_PLAN_API_KEY` | (选填) | 火山方舟 Agent Plan 专属密钥（订阅后从控制台换取） |
 | `MATHMODELING_MAX_DEBATE_ROUNDS` | `10` | 建模辩论最大轮数 |
 | `MATHMODELING_MAX_IMPL_RETRIES` | `3` | 代码实现最大重试次数 |
 | `MATHMODELING_DEFAULT_MAX_TOKENS` | `16384` | 单次 LLM 调用最大输出 |
@@ -263,7 +288,7 @@ python main.py <题目文件> [选项]
   --output, -o NAME     输出文件夹名（默认自动生成）
   --sensitivity, -s     启用 Layer 5 敏感性分析
   --max-rounds, -r N    每层最大辩论轮次（默认 10）
-  --provider, -p        指定 LLM provider（opencode / deepseek）
+  --provider, -p        指定 LLM provider（opencode / deepseek / volcengine / volcengine-plan）
   --start-layer N       从第 N 层开始（1-5，调试用）
 
 示例:
@@ -311,7 +336,7 @@ MathModelingAgents/
 - **编排引擎**：[LangGraph](https://github.com/langchain-ai/langgraph) — 构建有状态的多 Agent 工作流图
 - **LLM 接口**：`langchain-openai` (ChatOpenAI) — 兼容 OpenAI API 协议
 - **Tool Calling**：`langchain-core` — AIMessage / ToolMessage 工具调用协议
-- **模型**：DeepSeek V4 Pro / Flash、Qwen3.7-Max（通过 OpenCode Go 或官方 API）
+- **模型**：DeepSeek V4 Pro / Flash、Qwen3.7-Max、Kimi K2.7-Code、MiniMax M3（通过 OpenCode Go / 火山方舟 Agent & Coding Plan / DeepSeek 官方 API）
 - **计算沙盒**：`numpy` · `scipy` · `sympy` · `pandas` · `matplotlib` · `seaborn` · `scikit-learn` · `statsmodels`
 - **Web 搜索**：Tavily（推荐） / ddgs（DuckDuckGo 免费后端）
 

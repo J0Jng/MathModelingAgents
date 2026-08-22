@@ -17,7 +17,7 @@
 
 ```bash
 # OpenCode Go 接口（推荐，模型池丰富，18+ 模型）
-python main.py 题目.md --provider opencode --max-rounds 2
+python main.py "F:\app\wechat\chat\xwechat_files\wxid_qvq34t03am0632_2b2d\msg\file\2026-08\C题 面向算电协同的多目标调度优化研究\C题_完整资料与数据字典.md" --provider opencode --max-rounds 3
 
 # DeepSeek API 接口（简洁，仅 flash/pro 两个模型）
 python main.py C:\Users\joeji\Desktop\1.绿色物流配送\绿色物流配送_完整文档.md --provider deepseek --max-rounds 3
@@ -219,6 +219,8 @@ else:
 | 快速验证（<30min） | `--provider deepseek --max-rounds 1` | ~20 min |
 | 标准运行 | `--provider opencode --max-rounds 2` | ~60-90 min |
 | 正式比赛（高质量） | `--provider opencode --max-rounds 3` | ~90-120 min |
+| 火山方舟 Agent Plan（订阅套餐） | `--provider volcengine-plan --max-rounds 2` | ~60-90 min |
+| 火山方舟 Coding Plan（订阅套餐） | `--provider volcengine --max-rounds 2` | ~60-90 min |
 | 调试某层 | `--provider opencode --start-layer N` | 仅该层耗时 |
 
 ---
@@ -227,14 +229,58 @@ else:
 
 ```bash
 # 可选（有默认值）
-export MATHMODELING_LLM_PROVIDER=opencode    # opencode 或 deepseek
+export MATHMODELING_LLM_PROVIDER=volcengine-plan    # opencode / deepseek / volcengine / volcengine-plan
 export MATHMODELING_MAX_DEBATE_ROUNDS=3
 export MATHMODELING_ENABLE_SENSITIVITY=false
 
 # API Key（必须）
-# ~/.hermes/.env:
+# ~/.hermes/.env 或项目 .env:
 OPENCODE_GO_API_KEY=sk-...
 DEEPSEEK_API_KEY=sk-...
+# 火山方舟 Agent Plan（订阅后从控制台「开通管理」换取专属 Key）
+VOLCENGINE_PLAN_API_KEY=...
+# 火山方舟 Coding Plan（普通方舟 Key）
+VOLCENGINE_API_KEY=...
+```
+
+---
+
+## 六·五、火山方舟通道（v5，2026-08-18 接入）
+
+### v5 变更
+
+| 通道 | Base URL | 专属 Key | 角色覆盖 |
+|------|----------|----------|----------|
+| `volcengine`（Coding Plan） | `https://ark.cn-beijing.volces.com/api/coding/v3` | `VOLCENGINE_API_KEY` | 无额外覆盖；`qwen3.7-max` → 别名映射 `deepseek-v4-pro` |
+| `volcengine-plan`（Agent Plan） | `https://ark.cn-beijing.volces.com/api/plan/v3` | `VOLCENGINE_PLAN_API_KEY`（fallback `VOLCENGINE_API_KEY`） | L3 coder → `kimi-k2.7-code`；L4 writer → `minimax-m3` |
+
+### provider 级覆盖机制（新增）
+
+新增配置 `provider_layer_model_overrides`，优先于全局 `layer_model_overrides`：
+
+```python
+# default_config.py
+"provider_layer_model_overrides": {
+    "volcengine-plan": {
+        "implementation": {"coder": "kimi-k2.7-code"},
+        "paper": {"writer": "minimax-m3"},
+    },
+},
+"provider_model_aliases": {
+    "volcengine": {"qwen3.7-max": "deepseek-v4-pro"},
+    "volcengine-plan": {"qwen3.7-max": "minimax-m3"},
+},
+```
+
+### 路由优先级（get_layer_model，v5 更新）
+
+```
+provider == "deepseek"        → manager 用 deep_think_llm(pro)，其余 flash
+否则：
+  ① provider_layer_model_overrides[provider][layer][role]   # 新增，provider 级优先
+  ② layer_model_overrides[layer][role]（或 "agent" key）    # 全局
+  ③ quick_think_llm                                          # 兜底
+最后套 provider_model_aliases[provider] 别名映射
 ```
 
 ---
