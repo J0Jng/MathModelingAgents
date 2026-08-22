@@ -320,6 +320,6 @@ class GraphSetup:
         dests: dict = {}
         if 4 in self.selected_layers:
             dests["paper_agent"] = "paper_agent"
-        dests["sensitivity_scanner"] = "param_perturber"  # 启用时前置（ADR-0002）
+        dests["param_perturber"] = "param_perturber"  # 启用时前置（ADR-0002）
         dests[END] = END
         return dests

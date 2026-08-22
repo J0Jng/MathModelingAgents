@@ -27,11 +27,11 @@ class TestSensitivityGate:
     def test_auto_fail_open_without_decision(self):
         # auto 模式拿不到决策（字段缺失）-> 默认执行
         logic = make_logic("auto")
-        assert logic._route_after_impl({}) == "sensitivity_scanner"
+        assert logic._route_after_impl({}) == "param_perturber"
 
     def test_auto_respects_decision_true(self):
         logic = make_logic("auto")
-        assert logic._route_after_impl({"sensitivity_enabled": True}) == "sensitivity_scanner"
+        assert logic._route_after_impl({"sensitivity_enabled": True}) == "param_perturber"
 
     def test_auto_respects_decision_false(self):
         logic = make_logic("auto")
@@ -39,7 +39,7 @@ class TestSensitivityGate:
 
     def test_always_overrides_decision_false(self):
         logic = make_logic("always")
-        assert logic._route_after_impl({"sensitivity_enabled": False}) == "sensitivity_scanner"
+        assert logic._route_after_impl({"sensitivity_enabled": False}) == "param_perturber"
 
     def test_never_overrides_decision_true(self):
         logic = make_logic("never")
@@ -56,7 +56,7 @@ class TestSensitivityGate:
 
     def test_no_layer4_ends_after_sensitivity(self):
         logic = make_logic("always", selected=[1, 2, 3])
-        assert logic._route_after_impl({}) == "sensitivity_scanner"
+        assert logic._route_after_impl({}) == "param_perturber"
 
     def test_no_layer4_never_ends(self):
         logic = make_logic("never", selected=[1, 2, 3])

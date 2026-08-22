@@ -267,7 +267,7 @@ class ConditionalLogic:
         """
         if self._sensitivity_active(state):
             logger.info("Layer 3 -> Layer 5: 敏感性分析已启用，前置执行")
-            return "sensitivity_scanner"
+            return "param_perturber"
         if 4 in self.selected_layers:
             logger.info("Layer 3 → Layer 4: 进入论文写作")
             return "paper_agent"
