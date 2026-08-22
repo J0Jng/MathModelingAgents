@@ -202,6 +202,207 @@ def _sanitize_tool_pairing(messages: list) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# 共享 tool-calling 循环（Ticket D 收敛）：Solver/Viz/Paper 三 agent 复用同一骨架
+# ═══════════════════════════════════════════════════════════════════
+
+def _run_tool_loop(
+    *,
+    llm,
+    llm_with_tools,
+    tools,
+    layer_tag: str,
+    agent_tag: str,
+    max_iterations: int,
+    initial_messages: list,
+    max_retries: int = 3,
+    consecutive_no_tool_limit: int = 3,
+    sanitize: Callable[[list], list] | None = None,
+    on_summary_after_exhaust: Callable | None = None,
+    on_selfcheck: Callable | None = None,
+) -> tuple[list, str]:
+    """运行 agentic tool-calling 循环，返回 (messages, final_output)。
+
+    invoke（含 retry 退避）→ 派发工具 → consecutive_no_tool 计数 →
+    SELF_CHECK_PASSED 自检 → _extract_final_output。差异由调用方通过回调表达：
+    - sanitize:           每次交给 llm 前清洗消息（Paper REVISE 堵住裸回放损坏 pairing）
+    - on_summary_after_exhaust: 仅 Solver，自检未通过时追加 summary 兜底
+    - on_selfcheck:       仅 Paper，SELF_CHECK 后读盘补充论文正文
+
+    logging 文案逐字保留（layer_tag/agent_tag 注入前缀），依赖日志的测试/运维不受影响。
+    与原始实现一致：重试耗尽或非瞬态错误仍然向上抛出（不静默吞错）。
+    """
+    import json as _json
+    import time as _time
+    from langchain_core.messages import ToolMessage
+
+    messages = list(initial_messages)
+    consecutive_no_tool = 0
+
+    for iteration in range(max_iterations):
+        logger.info(
+            f"[{layer_tag}] {agent_tag} iteration {iteration + 1}/{max_iterations}"
+        )
+
+        # ── 交给 llm 前清洗（可选；对配对良好的消息为无副作用，仅去掉孤立消息）──
+        if sanitize is not None:
+            messages = sanitize(messages)
+
+        # ── Invoke LLM with retry ──
+        response = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = llm_with_tools.invoke(messages)
+                break
+            except Exception as e:
+                if attempt < max_retries and is_retryable_error(e):
+                    delay = 2 ** attempt
+                    logger.warning(
+                        f"[{layer_tag}] {agent_tag} LLM 调用重试 {attempt}/{max_retries}, "
+                        f"{delay}s: {e}"
+                    )
+                    _time.sleep(delay)
+                else:
+                    raise
+
+        messages.append(response)
+
+        # ── Process tool calls ──
+        if response.tool_calls:
+            consecutive_no_tool = 0
+            for tc in response.tool_calls:
+                tool_name = tc.get("name", "")
+                tool_args = tc.get("args", {})
+                tool_id = tc.get("id", "")
+
+                tool_fn = None
+                for t in tools:
+                    if t.name == tool_name:
+                        tool_fn = t
+                        break
+
+                if tool_fn is not None:
+                    try:
+                        result = tool_fn.invoke(tool_args)
+                    except Exception as e:
+                        result = f"[工具执行异常] {tool_name}: {e}"
+                        logger.error(
+                            f"[{layer_tag}] 工具 {tool_name} 执行失败: {e}"
+                        )
+                else:
+                    result = f"[未知工具] {tool_name}"
+
+                result_str = (
+                    _json.dumps(result, ensure_ascii=False)
+                    if isinstance(result, dict) else str(result)
+                )
+                messages.append(ToolMessage(
+                    content=result_str, tool_call_id=tool_id,
+                ))
+                logger.info(
+                    f"[{layer_tag}] {agent_tag} 工具 {tool_name}: "
+                    f"{result_str[:120]}..."
+                )
+        else:
+            consecutive_no_tool += 1
+            content = response.content or ""
+
+            if "SELF_CHECK_PASSED" in content:
+                logger.info(
+                    f"[{layer_tag}] {agent_tag} 自检通过 "
+                    f"(iteration {iteration + 1})"
+                )
+                break
+
+            if consecutive_no_tool >= consecutive_no_tool_limit:
+                logger.warning(
+                    f"[{layer_tag}] {agent_tag} {consecutive_no_tool} 轮无工具调用，"
+                    f"强制中断"
+                )
+                break
+
+    # ── Extract final text output ──
+    final_output = _extract_final_output(messages)
+
+    # ── 兜底：仅 Solver（自检未通过且回调非空）──
+    if "SELF_CHECK_PASSED" not in final_output and on_summary_after_exhaust is not None:
+        summary_text = on_summary_after_exhaust(llm, messages)
+        if summary_text:
+            final_output = summary_text
+
+    # ── 收尾：仅 Paper（SELF_CHECK 后读盘补正文）──
+    if on_selfcheck is not None and "SELF_CHECK_PASSED" in final_output:
+        final_output = on_selfcheck(final_output, messages) or final_output
+
+    return messages, final_output
+
+
+def _solver_summary(llm, messages) -> str | None:
+    """Layer3 SolverAgent 的 summary 兜底：自检未通过时让 LLM 总结已完成工作。"""
+    logger.info("[Layer3] SolverAgent 未自检通过，追加 summary 调用...")
+    try:
+        summary_msg = HumanMessage(content=(
+            "你的工具调用轮次已用完。请用一段文字总结你的工作成果：\n"
+            "1. 你创建了哪些代码文件？（用 write_file 保存的）\n"
+            "2. results.json 保存在哪里？里面有哪些关键数值？\n"
+            "3. 代码是否能成功执行？如果还有问题，列出未解决的部分。\n\n"
+            "请直接总结，不要调用工具。"
+        ))
+        summary_response = llm.invoke(_sanitize_tool_pairing(messages) + [summary_msg])
+        summary_text = summary_response.content or ""
+        if summary_text:
+            logger.info(
+                f"[Layer3] SolverAgent summary: "
+                f"{len(summary_text)} 字符"
+            )
+            return summary_text
+    except Exception as e:
+        logger.warning(f"[Layer3] SolverAgent summary 调用失败: {e}")
+    return None
+
+
+def _paper_read_disk(output_dir: str, final_output: str, messages: list) -> str:
+    """Layer4 PaperAgent 收尾：SELF_CHECK 通过后读盘补充论文正文。
+
+    仅在 final_output 含 SELF_CHECK_PASSED 时生效；无正文则回退到文本输出。
+    """
+    if "SELF_CHECK_PASSED" not in final_output:
+        return final_output
+    from pathlib import Path as _Path
+    paper_candidates = ["paper.md", "PaperAgent_paper.md", "final_paper.md"]
+    paper_dir = _Path(output_dir)
+    paper_text = ""
+    for fname in paper_candidates:
+        fpath = paper_dir / fname
+        if fpath.is_file():
+            try:
+                paper_text = fpath.read_text(encoding="utf-8")
+                logger.info(
+                    f"[Layer4] PaperAgent 从磁盘读取论文: "
+                    f"{fpath.name} ({len(paper_text)} 字符)"
+                )
+                break
+            except Exception as e:
+                logger.warning(
+                    f"[Layer4] PaperAgent 读取论文文件失败 {fpath}: {e}"
+                )
+    if paper_text and len(paper_text) > len(final_output):
+        combined = (
+            f"{final_output}\n\n"
+            f"---\n"
+            f"## 论文正文\n\n{paper_text}"
+        )
+        logger.info(
+            f"[Layer4] PaperAgent 输出已补充论文正文: "
+            f"{len(paper_text)} 字符"
+        )
+        return combined
+    logger.info(
+        f"[Layer4] PaperAgent 未找到论文文件，已回退到文本输出"
+    )
+    return final_output
+
+
+# ═══════════════════════════════════════════════════════════════════
 # ImplManager 文件扫描辅助 — 参考 TradingAgents Manager 模式：
 # 不依赖工具调用，在 LLM 调用前用 Python 扫描磁盘产出、
 # 将文件清单和关键内容注入审查上下文。
@@ -806,9 +1007,6 @@ def create_solver_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
     RETRY 时保留消息历史（impl_messages），在已有的完整对话基础上
     追加 ImplManager 的审查反馈继续修改，而非冷启动重写。
     """
-    import json as _json
-    import time as _time
-    from langchain_core.messages import ToolMessage
     from mathmodelingagents.tools import create_coding_agent_tools
 
     def node_fn(state: AgentState) -> dict[str, Any]:
@@ -862,114 +1060,18 @@ def create_solver_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
         llm = create_layer_llm(config, "implementation", "coder")
         llm_with_tools = llm.bind_tools(tools)
 
-        max_iterations = 30
-        consecutive_no_tool = 0
-
-        for iteration in range(max_iterations):
-            logger.info(
-                f"[Layer3] SolverAgent iteration {iteration + 1}/{max_iterations}"
-            )
-
-            # ── Invoke LLM with retry ──
-            response = None
-            for attempt in range(1, 4):
-                try:
-                    response = llm_with_tools.invoke(messages)
-                    break
-                except Exception as e:
-                    if attempt < 3 and is_retryable_error(e):
-                        delay = 2 ** attempt
-                        logger.warning(
-                            f"[Layer3] SolverAgent LLM 调用重试 {attempt}/3, "
-                            f"{delay}s: {e}"
-                        )
-                        _time.sleep(delay)
-                    else:
-                        raise
-
-            messages.append(response)
-
-            # ── Process tool calls ──
-            if response.tool_calls:
-                consecutive_no_tool = 0
-                for tc in response.tool_calls:
-                    tool_name = tc.get("name", "")
-                    tool_args = tc.get("args", {})
-                    tool_id = tc.get("id", "")
-
-                    # Find the matching tool
-                    tool_fn = None
-                    for t in tools:
-                        if t.name == tool_name:
-                            tool_fn = t
-                            break
-
-                    if tool_fn is not None:
-                        try:
-                            result = tool_fn.invoke(tool_args)
-                        except Exception as e:
-                            result = f"[工具执行异常] {tool_name}: {e}"
-                            logger.error(
-                                f"[Layer3] 工具 {tool_name} 执行失败: {e}"
-                            )
-                    else:
-                        result = f"[未知工具] {tool_name}"
-
-                    result_str = (
-                        _json.dumps(result, ensure_ascii=False)
-                        if isinstance(result, dict) else str(result)
-                    )
-                    messages.append(ToolMessage(
-                        content=result_str, tool_call_id=tool_id,
-                    ))
-                    logger.info(
-                        f"[Layer3] SolverAgent 工具 {tool_name}: "
-                        f"{result_str[:120]}..."
-                    )
-            else:
-                consecutive_no_tool += 1
-                content = response.content or ""
-
-                if "SELF_CHECK_PASSED" in content:
-                    logger.info(
-                        f"[Layer3] SolverAgent 自检通过 "
-                        f"(iteration {iteration + 1})"
-                    )
-                    break
-
-                if consecutive_no_tool >= 3:
-                    logger.warning(
-                        f"[Layer3] SolverAgent {consecutive_no_tool} 轮无工具调用，"
-                        f"强制中断"
-                    )
-                    break
-
-        # ── Extract final text output ──
-        final_output = _extract_final_output(messages)
-
-        # 如果没有 SELF_CHECK_PASSED 但工具已经产生了结果（max iterations
-        # 用尽），追加一次 summary 调用让 LLM 总结已完成的工作。
-        # 这确保 ImplManager 始终能看到有意义的产出描述。
-        if "SELF_CHECK_PASSED" not in final_output:
-            logger.info("[Layer3] SolverAgent 未自检通过，追加 summary 调用...")
-            try:
-                summary_msg = HumanMessage(content=(
-                    "你的工具调用轮次已用完。请用一段文字总结你的工作成果：\n"
-                    "1. 你创建了哪些代码文件？（用 write_file 保存的）\n"
-                    "2. results.json 保存在哪里？里面有哪些关键数值？\n"
-                    "3. 代码是否能成功执行？如果还有问题，列出未解决的部分。\n\n"
-                    "请直接总结，不要调用工具。"
-                ))
-                summary_response = llm.invoke(_sanitize_tool_pairing(messages) + [summary_msg])
-                summary_text = summary_response.content or ""
-                if summary_text:
-                    final_output = summary_text
-                    logger.info(
-                        f"[Layer3] SolverAgent summary: "
-                        f"{len(summary_text)} 字符"
-                    )
-            except Exception as e:
-                logger.warning(f"[Layer3] SolverAgent summary 调用失败: {e}")
+        # 共享 agentic loop；summary 兜底仅 Solver 启用
+        messages, final_output = _run_tool_loop(
+            llm=llm,
+            llm_with_tools=llm_with_tools,
+            tools=tools,
+            layer_tag="Layer3",
+            agent_tag="SolverAgent",
+            max_iterations=30,
+            initial_messages=messages,
+            sanitize=_sanitize_tool_pairing,
+            on_summary_after_exhaust=_solver_summary,
+        )
 
         retry_count = state.get("impl_retry_count", 0)
 
@@ -999,9 +1101,6 @@ def create_viz_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
 
     如果图表生成失败，通过 impl_messages 实现自循环重试。
     """
-    import json as _json
-    import time as _time
-    from langchain_core.messages import ToolMessage
     from mathmodelingagents.tools import create_coding_agent_tools
 
     def node_fn(state: AgentState) -> dict[str, Any]:
@@ -1041,89 +1140,17 @@ def create_viz_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
         llm = create_layer_llm(config, "implementation", "coder")
         llm_with_tools = llm.bind_tools(tools)
 
-        max_iterations = 10  # 图表生成应该很快
-        consecutive_no_tool = 0
-
-        for iteration in range(max_iterations):
-            logger.info(
-                f"[Layer3] VizAgent iteration {iteration + 1}/{max_iterations}"
-            )
-
-            # ── Invoke LLM with retry ──
-            response = None
-            for attempt in range(1, 4):
-                try:
-                    response = llm_with_tools.invoke(messages)
-                    break
-                except Exception as e:
-                    if attempt < 3 and is_retryable_error(e):
-                        delay = 2 ** attempt
-                        logger.warning(
-                            f"[Layer3] VizAgent LLM 调用重试 {attempt}/3, "
-                            f"{delay}s: {e}"
-                        )
-                        _time.sleep(delay)
-                    else:
-                        raise
-
-            messages.append(response)
-
-            # ── Process tool calls ──
-            if response.tool_calls:
-                consecutive_no_tool = 0
-                for tc in response.tool_calls:
-                    tool_name = tc.get("name", "")
-                    tool_args = tc.get("args", {})
-                    tool_id = tc.get("id", "")
-
-                    tool_fn = None
-                    for t in tools:
-                        if t.name == tool_name:
-                            tool_fn = t
-                            break
-
-                    if tool_fn is not None:
-                        try:
-                            result = tool_fn.invoke(tool_args)
-                        except Exception as e:
-                            result = f"[工具执行异常] {tool_name}: {e}"
-                            logger.error(
-                                f"[Layer3] 工具 {tool_name} 执行失败: {e}"
-                            )
-                    else:
-                        result = f"[未知工具] {tool_name}"
-
-                    result_str = (
-                        _json.dumps(result, ensure_ascii=False)
-                        if isinstance(result, dict) else str(result)
-                    )
-                    messages.append(ToolMessage(
-                        content=result_str, tool_call_id=tool_id,
-                    ))
-                    logger.info(
-                        f"[Layer3] VizAgent 工具 {tool_name}: "
-                        f"{result_str[:120]}..."
-                    )
-            else:
-                consecutive_no_tool += 1
-                content = response.content or ""
-
-                if "SELF_CHECK_PASSED" in content:
-                    logger.info(
-                        f"[Layer3] VizAgent 自检通过 "
-                        f"(iteration {iteration + 1})"
-                    )
-                    break
-
-                if consecutive_no_tool >= 3:
-                    logger.warning(
-                        f"[Layer3] VizAgent {consecutive_no_tool} 轮无工具调用，"
-                        f"强制中断"
-                    )
-                    break
-
-        # ── Extract final text output ──
-        final_output = _extract_final_output(messages)
+        # 共享 agentic loop；Viz：max_iterations=10，无 summary / 读盘兜底
+        messages, final_output = _run_tool_loop(
+            llm=llm,
+            llm_with_tools=llm_with_tools,
+            tools=tools,
+            layer_tag="Layer3",
+            agent_tag="VizAgent",
+            max_iterations=10,  # 图表生成应该很快
+            initial_messages=messages,
+            sanitize=_sanitize_tool_pairing,
+        )
 
         logger.info(
             f"[Layer3] VizAgent 完成: {len(messages)} 条消息, "
@@ -1267,9 +1294,6 @@ def create_paper_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
 
     工具列表：read_file, list_dir, write_file（只读为主，无 run_code）
     """
-    import json as _json
-    import time as _time
-    from langchain_core.messages import ToolMessage
     from mathmodelingagents.tools import create_paper_agent_tools
 
     def node_fn(state: AgentState) -> dict[str, Any]:
@@ -1311,130 +1335,23 @@ def create_paper_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
         llm = create_layer_llm(config, "paper", "writer")
         llm_with_tools = llm.bind_tools(tools)
 
-        max_iterations = 30
-        consecutive_no_tool = 0
+        # 共享 agentic loop；loop 内 sanitize 堵住 REVISE 裸回放损坏 pairing 的
+        # latent bug（Paper-manager revision bug，本轮一并修）。
+        # on_selfcheck：SELF_CHECK 后读盘补充论文正文（仅 Paper）。
+        def selfcheck(final_output: str, messages: list) -> str:
+            return _paper_read_disk(output_dir, final_output, messages)
 
-        for iteration in range(max_iterations):
-            logger.info(
-                f"[Layer4] PaperAgent iteration {iteration + 1}/{max_iterations}"
-            )
-
-            # ── Invoke LLM with retry ──
-            response = None
-            for attempt in range(1, 4):
-                try:
-                    response = llm_with_tools.invoke(messages)
-                    break
-                except Exception as e:
-                    if attempt < 3 and is_retryable_error(e):
-                        delay = 2 ** attempt
-                        logger.warning(
-                            f"[Layer4] PaperAgent LLM 调用重试 {attempt}/3, "
-                            f"{delay}s: {e}"
-                        )
-                        _time.sleep(delay)
-                    else:
-                        raise
-
-            messages.append(response)
-
-            # ── Process tool calls ──
-            if response.tool_calls:
-                consecutive_no_tool = 0
-                for tc in response.tool_calls:
-                    tool_name = tc.get("name", "")
-                    tool_args = tc.get("args", {})
-                    tool_id = tc.get("id", "")
-
-                    tool_fn = None
-                    for t in tools:
-                        if t.name == tool_name:
-                            tool_fn = t
-                            break
-
-                    if tool_fn is not None:
-                        try:
-                            result = tool_fn.invoke(tool_args)
-                        except Exception as e:
-                            result = f"[工具执行异常] {tool_name}: {e}"
-                            logger.error(
-                                f"[Layer4] 工具 {tool_name} 执行失败: {e}"
-                            )
-                    else:
-                        result = f"[未知工具] {tool_name}"
-
-                    result_str = (
-                        _json.dumps(result, ensure_ascii=False)
-                        if isinstance(result, dict) else str(result)
-                    )
-                    messages.append(ToolMessage(
-                        content=result_str, tool_call_id=tool_id,
-                    ))
-                    logger.info(
-                        f"[Layer4] PaperAgent 工具 {tool_name}: "
-                        f"{result_str[:120]}..."
-                    )
-            else:
-                consecutive_no_tool += 1
-                content = response.content or ""
-
-                if "SELF_CHECK_PASSED" in content:
-                    logger.info(
-                        f"[Layer4] PaperAgent 自检通过 "
-                        f"(iteration {iteration + 1})"
-                    )
-                    break
-
-                if consecutive_no_tool >= 3:
-                    logger.warning(
-                        f"[Layer4] PaperAgent {consecutive_no_tool} 轮无工具调用，"
-                        f"强制中断"
-                    )
-                    break
-
-        # ── Extract final text output ──
-        final_output = _extract_final_output(messages)
-
-        # ── 自检通过后尝试从磁盘读取完整论文正文 ──
-        # PaperAgent 通过 write_file 工具将论文写入文件，但其文本输出（final_output）
-        # 只包含自检摘要。这导致 PaperManager 看不到论文正文，反复 REVISE。
-        # 修复：SELF_CHECK_PASSED 时尝试读取磁盘上的论文文件，补充到输出中。
-        if "SELF_CHECK_PASSED" in final_output:
-            from pathlib import Path as _Path
-            paper_candidates = ["paper.md", "PaperAgent_paper.md", "final_paper.md"]
-            paper_dir = _Path(output_dir)
-            paper_text = ""
-            for fname in paper_candidates:
-                fpath = paper_dir / fname
-                if fpath.is_file():
-                    try:
-                        paper_text = fpath.read_text(encoding="utf-8")
-                        logger.info(
-                            f"[Layer4] PaperAgent 从磁盘读取论文: "
-                            f"{fpath.name} ({len(paper_text)} 字符)"
-                        )
-                        break
-                    except Exception as e:
-                        logger.warning(
-                            f"[Layer4] PaperAgent 读取论文文件失败 {fpath}: {e}"
-                        )
-            # 如果读取到论文正文，用它替换 final_output（保留自检标记）
-            # 这样 PaperManager 就能看到完整论文内容进行审查
-            if paper_text and len(paper_text) > len(final_output):
-                combined = (
-                    f"{final_output}\n\n"
-                    f"---\n"
-                    f"## 论文正文\n\n{paper_text}"
-                )
-                final_output = combined
-                logger.info(
-                    f"[Layer4] PaperAgent 输出已补充论文正文: "
-                    f"{len(paper_text)} 字符"
-                )
-            else:
-                logger.info(
-                    f"[Layer4] PaperAgent 未找到论文文件，已回退到文本输出"
-                )
+        messages, final_output = _run_tool_loop(
+            llm=llm,
+            llm_with_tools=llm_with_tools,
+            tools=tools,
+            layer_tag="Layer4",
+            agent_tag="PaperAgent",
+            max_iterations=30,
+            initial_messages=messages,
+            sanitize=_sanitize_tool_pairing,
+            on_selfcheck=selfcheck,
+        )
 
         round_num = (state.get("model_debate_state") or {}).get("round_count", 0) or 1
 
