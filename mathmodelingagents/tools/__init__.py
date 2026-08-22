@@ -186,7 +186,8 @@ def run_code(
             are importable inside the sandbox (restrictive). Defaults to None =
             no extra restriction (blocklist-only). The data-science stack
             (``DEFAULT_ALLOWED_MODULES``) is the reference set a caller may pass
-            to opt into: see ``build_preamble``.cwd: Optional working directory. When given, the script runs in this
+            to opt into: see ``build_preamble``.
+        cwd: Optional working directory. When given, the script runs in this
             directory and any files it creates survive the call.
 
     Returns:

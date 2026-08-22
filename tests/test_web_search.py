@@ -60,3 +60,36 @@ class TestWebSearchOff:
     def test_config_off_returns_disabled_prefix(self):
         # 不开网络：config=off 时直接返回禁用文案，断言前缀
         assert ws.web_search("anything", config={"web_search_provider": "off"}).startswith("[搜索未启用]")
+
+
+class TestFormatResults:
+    def test_formats_markdown_output(self):
+        out = ws._format_results(
+            "q", "tavily",
+            [{"title": "标题", "url": "http://x", "content": "内容"}],
+        )
+        assert "provider: tavily" in out
+        assert "[标题](http://x)" in out
+
+    def test_truncates_long_content(self):
+        out = ws._format_results("q", "tavily", [{"title": "t", "url": "u", "content": "x" * 500}])
+        assert "…" in out
+        assert len(out) < 300
+
+
+class TestTavilyFailureFallsBackToDdgs:
+    def test_relabels_provider_to_ddgs(self, monkeypatch):
+        def fake_tavily(*a, **k):
+            raise RuntimeError("tavily down")
+
+        def fake_ddgs(*a, **k):
+            return [{"title": "dd", "url": "http://d", "content": "c"}]
+
+        monkeypatch.setattr(ws, "_search_tavily", fake_tavily)
+        monkeypatch.setattr(ws, "_search_ddgs", fake_ddgs)
+        out = ws.web_search(
+            "q", config={"web_search_provider": "tavily", "tavily_api_key": "k"}
+        )
+        # tavily 失败 → 降级 ddgs 成功，输出正常且 provider 重标为 ddgs
+        assert out.startswith("### 搜索结果")
+        assert "provider: ddgs" in out

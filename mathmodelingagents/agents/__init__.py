@@ -207,9 +207,9 @@ def _sanitize_tool_pairing(messages: list) -> list:
 
 def _run_tool_loop(
     *,
-    llm,
-    llm_with_tools,
-    tools,
+    llm: Any,
+    llm_with_tools: Any,
+    tools: list,
     layer_tag: str,
     agent_tag: str,
     max_iterations: int,
@@ -217,8 +217,8 @@ def _run_tool_loop(
     max_retries: int = 3,
     consecutive_no_tool_limit: int = 3,
     sanitize: Callable[[list], list] | None = None,
-    on_summary_after_exhaust: Callable | None = None,
-    on_selfcheck: Callable | None = None,
+    on_summary_after_exhaust: Callable[[Any, list], str | None] | None = None,
+    on_selfcheck: Callable[[str, list], str] | None = None,
 ) -> tuple[list, str]:
     """运行 agentic tool-calling 循环，返回 (messages, final_output)。
 
