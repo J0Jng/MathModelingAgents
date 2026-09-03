@@ -8,8 +8,17 @@
 from __future__ import annotations
 
 import logging
+import os
+
+import questionary
+from rich.console import Console
+
+from cli.model_catalog import MODEL_OPTIONS, get_model_options  # 静态降级清单
+from cli.model_fetcher import fetch_models  # 实时拉取
 
 logger = logging.getLogger(__name__)
+
+console = Console()
 
 # 角色 → 思考深度分类（仅用于本模块内部）。
 _DEEP_ROLES = {"manager", "writer", "coder", "algorithm"}
@@ -19,22 +28,75 @@ _QUICK_VAR = "MATHMODELING_QUICK_THINK_LLM"
 _DEEP_VAR = "MATHMODELING_DEEP_THINK_LLM"
 
 
-def _pick_single(mode: str, provider: str) -> str | None:
-    """弹单个 questionary.select；返回模型 id 或 None（Ctrl-C/取消）。"""
-    import os
+def _is_env_locked(mode: str) -> bool:
+    return bool(os.getenv(_QUICK_VAR if mode == "quick" else _DEEP_VAR))
 
-    env_var = _QUICK_VAR if mode == "quick" else _DEEP_VAR
-    env_val = os.getenv(env_var)
-    if env_val:
-        logger.info("%s 已设置，跳过 %s 选择", env_var, mode)
+
+def _build_options(provider: str, mode: str) -> list[tuple[str, str]]:
+    """菜单项：优先实时拉取，失败降级静态清单，末尾恒有 Custom。"""
+    realtime = fetch_models(provider)
+    if realtime:
+        # 实时列表：可为空但非空时全部展示；deep/quick 暂不区分(模型自含思考能力)
+        options = [(m, m) for m in realtime]
+    else:
+        options = list(get_model_options(provider, mode))
+    # 始终追加 Custom 兜底,去重
+    if not any(mid == "custom" for _, mid in options):
+        options.append(("Custom model ID", "custom"))
+    return options
+
+
+def _pick_single(mode: str, provider: str) -> str | None:
+    """弹单个 questionary.select。返回模型 id；None 表示 env 锁定或取消。"""
+    if _is_env_locked(mode):
         return None
-    raise NotImplementedError("交互选择由 Task 4 实现")
+    options = _build_options(provider, mode)
+    choice = questionary.select(
+        f"Select Your [{mode.title()}-Thinking] LLM Engine ({provider}):",
+        choices=[questionary.Choice(display, value=value) for display, value in options],
+        instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
+        style=questionary.Style([
+            ("selected", "fg:magenta noinherit"),
+            ("highlighted", "fg:magenta noinherit"),
+            ("pointer", "fg:magenta noinherit"),
+        ]),
+    ).ask()
+    if choice is None:
+        return None  # Ctrl-C / Esc
+    if choice == "custom":
+        custom = questionary.text(
+            "Enter custom model ID:",
+            validate=lambda x: len(x.strip()) > 0 or "Please enter a model ID.",
+        ).ask()
+        return custom.strip() if custom else None
+    return choice
 
 
 def prompt_model_selection(config: dict) -> dict:
-    """主入口：根据 provider 弹菜单，返回应写回 config 的变更字典。"""
-    provider = config.get("llm_provider", "opencode")
-    return {}  # Task 4 填充完整逻辑
+    """主入口：根据 provider 弹 Quick/Deep 菜单，返回变更字典。
+
+    - provider 非支持类型 → 返回 {}（不阻塞，向后兼容）。
+    - 任一 env（QUICK/DEEP）已设置 → 返回 {}（env 已接管，避免无 TTY 卡死）。
+    - 用户取消任意一次 → 返回 {}（保持当前配置）。
+    """
+    provider = str(config.get("llm_provider", "opencode")).lower()
+    # 实际判定：provider 是否在 model_catalog 支持范围内（实时拉取同源）。
+    if provider not in MODEL_OPTIONS:
+        logger.info("provider %s 无交互模型目录，跳过模型选择", provider)
+        return {}
+    if _is_env_locked("quick") or _is_env_locked("deep"):
+        logger.info("MATHMODELING_QUICK/DEEP_THINK_LLM 已设置，跳过交互模型选择")
+        return {}
+
+    quick = _pick_single("quick", provider)
+    deep = _pick_single("deep", provider)
+
+    chosen: dict = {}
+    if quick:
+        chosen["quick"] = quick
+    if deep:
+        chosen["deep"] = deep
+    return chosen
 
 
 def _apply_model_selection(config: dict, provider: str, chosen: dict) -> dict:
