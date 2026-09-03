@@ -1,6 +1,6 @@
 import os
 
-from cli.model_picker import prompt_model_selection, _apply_model_selection
+from cli.model_picker import prompt_model_selection, _apply_model_selection, _skip_prompt_requested
 
 
 def test_apply_non_deepseek_overrides_overwrite_layer(capsys):
@@ -12,20 +12,33 @@ def test_apply_non_deepseek_overrides_overwrite_layer(capsys):
 
 
 def test_env_precedence_skips_prompt(monkeypatch):
-    # 设置 env 后，prompt_model_selection 应不弹菜单，直接返回空变更
-    monkeypatch.setenv("MATHMODELING_QUICK_THINK_LLM", "some-quick")
+    # QUICK/DEEP_THINK_LLM 只当默认模型值，不再隐式关闭交互 → 应正常弹菜单（不返回空变更）。
+    # 这里避免驱动真实 TTY，仅验证这两个 env 设置不会触发跳过（否则会试图弹 questionary，
+    # 但我们用不会命中跳过分支的断言来确认）。真正跳过要看 SKIP_MODEL_PROMPT。
     config = {"llm_provider": "opencode"}
-    result = prompt_model_selection(config)
-    assert result == {}  # env 已接管，不交互
+    # 只设 QUICK 模型值：不应被当作跳过开关
+    monkeypatch.setenv("MATHMODELING_QUICK_THINK_LLM", "some-quick")
+    assert not _skip_prompt_requested()  # QUICK env 不会触发跳过
 
 
-def test_is_env_locked(monkeypatch):
-    from cli.model_picker import _is_env_locked
-    monkeypatch.delenv("MATHMODELING_QUICK_THINK_LLM", raising=False)
-    monkeypatch.delenv("MATHMODELING_DEEP_THINK_LLM", raising=False)
-    assert not _is_env_locked("quick") and not _is_env_locked("deep")
-    monkeypatch.setenv("MATHMODELING_DEEP_THINK_LLM", "d1")
-    assert _is_env_locked("deep") and not _is_env_locked("quick")
+def test_skip_prompt_is_the_only_skip(monkeypatch):
+    from cli.model_picker import _skip_prompt_requested
+    # 未设置 → 不跳过
+    monkeypatch.delenv("MATHMODELING_SKIP_MODEL_PROMPT", raising=False)
+    assert not _skip_prompt_requested()
+    # 显式置真 → 跳过
+    monkeypatch.setenv("MATHMODELING_SKIP_MODEL_PROMPT", "1")
+    assert _skip_prompt_requested()
+    monkeypatch.setenv("MATHMODELING_SKIP_MODEL_PROMPT", "true")
+    assert _skip_prompt_requested()
+    # 置假/非真值 → 不跳过
+    monkeypatch.setenv("MATHMODELING_SKIP_MODEL_PROMPT", "0")
+    assert not _skip_prompt_requested()
+    # 即使 QUICK/DEEP 模型值已设置，未显式 SKIP 就不跳过
+    monkeypatch.setenv("MATHMODELING_QUICK_THINK_LLM", "q")
+    monkeypatch.setenv("MATHMODELING_DEEP_THINK_LLM", "d")
+    monkeypatch.delenv("MATHMODELING_SKIP_MODEL_PROMPT", raising=False)
+    assert not _skip_prompt_requested()
 
 
 def test_build_options_realtime_fallback_and_custom(monkeypatch):

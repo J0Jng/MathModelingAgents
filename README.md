@@ -57,10 +57,11 @@ Select Your [Deep-Thinking] LLM Engine (volcengine-plan):    # 深度思考模�
 
 | 环境变量 | 作用 |
 |---------|------|
-| `MATHMODELING_QUICK_THINK_LLM` | 设置后跳过快速思考模型交互，直接使用该值 |
-| `MATHMODELING_DEEP_THINK_LLM` | 设置后跳过深度思考模型交互，直接使用该值 |
+| `MATHMODELING_QUICK_THINK_LLM` | 快速思考模型的默认值（仅作默认模型，**不**关闭交互） |
+| `MATHMODELING_DEEP_THINK_LLM` | 深度思考模型的默认值（仅作默认模型，**不**关闭交互） |
+| `MATHMODELING_SKIP_MODEL_PROMPT` | 显式设为 `1`/`true`/`yes`/`on` 时**跳过全部交互菜单**（适合 CI / 脚本 / 无 TTY 环境） |
 
-> 设任一 env 变量即跳过对应交互；**两个都设置 = 完全跳过交互**，适合 CI / 脚本 / 无 TTY 环境。provider 未知或交互异常时自动走默认模型，绝不阻塞。
+> 设置 `MATHMODELING_SKIP_MODEL_PROMPT=1` 可完全跳过交互，直接使用默认模型。未显式设置该变量时，交互菜单照常弹出——即使你已在 `.env` 里用了 `QUICK/DEEP_THINK_LLM` 指定默认模型。provider 未知或交互异常时自动走默认模型，绝不阻塞。
 
 ## 架构
 

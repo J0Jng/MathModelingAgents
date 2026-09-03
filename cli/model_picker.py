@@ -23,13 +23,15 @@ console = Console()
 # 角色 → 思考深度分类（仅用于本模块内部）。
 _DEEP_ROLES = {"manager", "writer", "coder", "algorithm"}
 
-# 允许通过环境变量跳过交互（对齐 TradingAgents env-precedence 规则）。
-_QUICK_VAR = "MATHMODELING_QUICK_THINK_LLM"
-_DEEP_VAR = "MATHMODELING_DEEP_THINK_LLM"
+# 允许通过环境变量跳过交互（显式设置才跳过）。
+# 注意：不加 read QUICK/DEEP_THINK_LLM —— 那俩只当默认模型值，不能隐式关闭交互。
+_SKIP_PROMPT_VAR = "MATHMODELING_SKIP_MODEL_PROMPT"
+_SKIP_TRUE = {"1", "true", "yes", "on"}
 
 
-def _is_env_locked(mode: str) -> bool:
-    return bool(os.getenv(_QUICK_VAR if mode == "quick" else _DEEP_VAR))
+def _skip_prompt_requested() -> bool:
+    """仅当 MATHMODELING_SKIP_MODEL_PROMPT 显式置真时跳过交互。"""
+    return os.getenv(_SKIP_PROMPT_VAR, "").strip().lower() in _SKIP_TRUE
 
 
 def _build_options(provider: str, mode: str) -> list[tuple[str, str]]:
@@ -47,9 +49,7 @@ def _build_options(provider: str, mode: str) -> list[tuple[str, str]]:
 
 
 def _pick_single(mode: str, provider: str) -> str | None:
-    """弹单个 questionary.select。返回模型 id；None 表示 env 锁定或取消。"""
-    if _is_env_locked(mode):
-        return None
+    """弹单个 questionary.select。返回模型 id；None 表示取消（Ctrl-C/Esc）。"""
     options = _build_options(provider, mode)
     choice = questionary.select(
         f"Select Your [{mode.title()}-Thinking] LLM Engine ({provider}):",
@@ -76,7 +76,7 @@ def prompt_model_selection(config: dict) -> dict:
     """主入口：根据 provider 弹 Quick/Deep 菜单，返回变更字典。
 
     - provider 非支持类型 → 返回 {}（不阻塞，向后兼容）。
-    - 任一 env（QUICK/DEEP）已设置 → 返回 {}（env 已接管，避免无 TTY 卡死）。
+    - MATHMODELING_SKIP_MODEL_PROMPT 显式置真 → 返回 {}（env 已接管，CI/无 TTY 用）。
     - 用户取消任意一次 → 返回 {}（保持当前配置）。
     """
     provider = str(config.get("llm_provider", "opencode")).lower()
@@ -84,8 +84,8 @@ def prompt_model_selection(config: dict) -> dict:
     if provider not in MODEL_OPTIONS:
         logger.info("provider %s 无交互模型目录，跳过模型选择", provider)
         return {}
-    if _is_env_locked("quick") or _is_env_locked("deep"):
-        logger.info("MATHMODELING_QUICK/DEEP_THINK_LLM 已设置，跳过交互模型选择")
+    if _skip_prompt_requested():
+        logger.info("MATHMODELING_SKIP_MODEL_PROMPT 已设置，跳过交互模型选择")
         return {}
 
     quick = _pick_single("quick", provider)
