@@ -21,6 +21,8 @@ from mathmodelingagents.agents import (
     create_paper_agent, create_paper_manager,
     # Layer 5
     create_param_perturber, create_robustness_analyst, create_sensitivity_manager,
+    # 模型解释（explain 模式，--from-layer1）
+    create_explainer,
     # Utility
     create_msg_delete,
 )
@@ -55,6 +57,8 @@ class GraphSetup:
         # 守卫 sensitivity_active 在路由与上下文注入两处读到的 config 形态一致）
         self.selected_layers = config.get("selected_layers", [1, 2, 3, 4])
         self.sensitivity_mode = resolve_sensitivity_mode(config)
+        # 解释模式（--from-layer1）：L3(+L5) 后产出模型解释文档而非论文
+        self.explain_mode = config.get("explain_mode", False)
 
         # 创建所有 Agent 节点
         self._create_agent_nodes()
@@ -68,6 +72,7 @@ class GraphSetup:
             max_impl_retries=config.get("max_impl_retries", 3),
             selected_layers=self.selected_layers,
             sensitivity_mode=self.sensitivity_mode,
+            explain_mode=self.explain_mode,
         )
 
     def _create_agent_nodes(self):
@@ -99,6 +104,9 @@ class GraphSetup:
         self.param_perturber = create_param_perturber(config)
         self.robustness_analyst = create_robustness_analyst(config)
         self.sensitivity_manager = create_sensitivity_manager(config)
+
+        # 模型解释（explain 模式终点节点）
+        self.explainer = create_explainer(config)
 
         # Utility nodes
         self.clear_problem = create_msg_delete()
@@ -145,6 +153,7 @@ class GraphSetup:
         self._add_layer3_nodes(workflow)
         self._add_layer4_nodes(workflow)
         self._add_layer5_nodes(workflow)
+        self._add_explainer_nodes(workflow)
 
         # ═══ 添加边（层间连接） ═══
         self._connect_layers(workflow)
@@ -193,6 +202,11 @@ class GraphSetup:
         workflow.add_node("param_perturber", self.param_perturber)
         workflow.add_node("robustness_analyst", self.robustness_analyst)
         workflow.add_node("sensitivity_manager", self.sensitivity_manager)
+
+    def _add_explainer_nodes(self, workflow: StateGraph):
+        """添加模型解释节点（无条件构建，启用与否由运行时路由决定）。"""
+        workflow.add_node("explainer", self.explainer)
+        workflow.add_edge("explainer", END)
 
     # ═══════════════════════════════════════════
     # 连接层
@@ -281,7 +295,9 @@ class GraphSetup:
         workflow.add_edge("param_perturber", "robustness_analyst")
         workflow.add_edge("robustness_analyst", "sensitivity_manager")
         l5_dests: dict = {"__end__": END}
-        if 4 in self.selected_layers:
+        if self.explain_mode:
+            l5_dests["explainer"] = "explainer"
+        elif 4 in self.selected_layers:
             l5_dests["paper_agent"] = "paper_agent"
         workflow.add_conditional_edges(
             "sensitivity_manager",
@@ -316,9 +332,14 @@ class GraphSetup:
         return dests
 
     def _get_layer3_destinations(self) -> dict:
-        """Layer 3 完成后的目标映射（clear_impl -> 敏感性分析或论文层，动态）。"""
+        """Layer 3 完成后的目标映射（clear_impl -> 敏感性分析/模型解释/论文层，动态）。
+
+        解释模式下目标为 explainer（不含 paper_agent）；非解释模式维持现状。
+        """
         dests: dict = {}
-        if 4 in self.selected_layers:
+        if self.explain_mode:
+            dests["explainer"] = "explainer"
+        elif 4 in self.selected_layers:
             dests["paper_agent"] = "paper_agent"
         dests["param_perturber"] = "param_perturber"  # 启用时前置（ADR-0002）
         dests[END] = END

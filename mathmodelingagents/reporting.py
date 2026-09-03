@@ -32,6 +32,7 @@ AGENT_DISPLAY: dict[str, tuple[str, str]] = {
     "param_perturber":    ("参数扰动师",   "分析"),
     "robustness_analyst": ("稳健性分析师", "分析"),
     "sensitivity_manager":("敏感性经理",   "裁决"),
+    "explainer":          ("模型解释 Agent", "撰写"),
 }
 
 LAYER_NAMES: dict[str, str] = {
@@ -40,6 +41,7 @@ LAYER_NAMES: dict[str, str] = {
     "implementation": "Layer3_代码实现",
     "paper":          "Layer4_论文写作",
     "sensitivity":    "Layer5_敏感性分析",
+    "explanation":    "模型解释文档",
 }
 
 LAYER_TITLES: dict[str, str] = {
@@ -48,9 +50,10 @@ LAYER_TITLES: dict[str, str] = {
     "implementation": "Layer 3: 代码实现",
     "paper":          "Layer 4: 论文写作",
     "sensitivity":    "Layer 5: 敏感性分析",
+    "explanation":    "模型解释文档",
 }
 
-LAYER_ORDER = ["problem", "modeling", "implementation", "paper", "sensitivity"]
+LAYER_ORDER = ["problem", "modeling", "implementation", "paper", "sensitivity", "explanation"]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -133,10 +136,11 @@ def finalize_reports(
     state: dict[str, Any],
     problem_name: str = "",
 ) -> list[str]:
-    """流程结束后写入 summary.md 和 final_paper.md。
+    """流程结束后写入 summary.md 和 final_paper.md（或 model_explanation.md）。
 
     层文件已通过 append_agent_output 增量写入完毕，
     这里只生成需要完整 state 的汇总和论文。
+    解释模式（explanation_doc 非空）时写 model_explanation.md 并跳过 final_paper.md。
     """
     out = Path(output_dir)
     written: list[str] = []
@@ -147,10 +151,26 @@ def finalize_reports(
     summary_path.write_text(_build_summary(outputs, state), encoding="utf-8")
     written.append(str(summary_path))
 
-    # final_paper.md
-    paper_path = out / "final_paper.md"
-    paper_path.write_text(_build_final_paper(state, problem_name), encoding="utf-8")
-    written.append(str(paper_path))
+    explanation = (state.get("explanation_doc") or "").strip()
+    if explanation:
+        # 解释模式：产出模型解释文档，跳过论文
+        raw = explanation
+        for marker in ["**CONCLUDE**", "**CONTINUE**", "**REVISE**", "**ACCEPT**", "**REJECT**"]:
+            raw = raw.replace(marker, "")
+        title = f"# {problem_name} 模型解释文档" if problem_name else "# 模型解释文档"
+        content = "\n".join([
+            title, "",
+            f"> 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "", "---\n", raw,
+        ])
+        explanation_path = out / "model_explanation.md"
+        explanation_path.write_text(content, encoding="utf-8")
+        written.append(str(explanation_path))
+    else:
+        # final_paper.md
+        paper_path = out / "final_paper.md"
+        paper_path.write_text(_build_final_paper(state, problem_name), encoding="utf-8")
+        written.append(str(paper_path))
 
     logger.info(f"最终报告完成: {len(written)} 个文件 → {output_dir}")
     return written
@@ -261,8 +281,12 @@ def _build_summary(all_outputs: list[dict], state: dict) -> str:
     impl_retries = state.get("impl_retry_count", 0)
     err = state.get("error_analysis", "")
     lines.append(f"- Layer 3 代码实现: 重试 {impl_retries} 次" + (" (有错误)" if err else " (成功)"))
-    final = state.get("final_paper", "")
-    lines.append(f"- Layer 4 论文: {'已生成' if final else '未生成'} ({len(final):,} 字)")
+    explanation = (state.get("explanation_doc") or "").strip()
+    if explanation:
+        lines.append(f"- 模型解释文档: 已生成 ({len(explanation):,} 字)")
+    else:
+        final = state.get("final_paper", "")
+        lines.append(f"- Layer 4 论文: {'已生成' if final else '未生成'} ({len(final):,} 字)")
 
     lines.append("\n---\n## 输出文件\n")
     lines.append(f"- 各层详细输出: `LayerN_*.md`")

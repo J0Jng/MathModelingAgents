@@ -6,13 +6,24 @@
 
 > 多智能体协作的数学建模竞赛全流程框架。输入题目，自动产出完整论文。
 
-**5 层架构 · 16 个专职 Agent · 辩论循环 · Agentic Tool Calling · Web 搜索 · Prompt 缓存优化 · 增量写盘容灾**
+**5 层架构 · 17 个专职 Agent · 辩论循环 · Agentic Tool Calling · Web 搜索 · Prompt 缓存优化 · 增量写盘容灾**
 
 ```
 题目文件 ──→ [L1: 问题分析] ──→ [L2: 数学建模] ──→ [L3: 代码实现] ──→ [L4: 论文写作] ──→ 完整论文
               顺序流水线          辩论循环             Agentic 循环         Agentic 循环
                                                         (写→跑→修)          (写→查→改)
                                     (可选) [L5: 敏感性分析]
+```
+
+另有一种**恢复模式**：从一份已完成的 Layer 1 数据出发，只跑 L2→L3（L1 判需敏感性时再插 L5），
+产出**模型解释文档**（面向团队的技术说明）而非竞赛论文：
+
+```
+已有 Layer1 数据 ──→ [L2: 数学建模] ──→ [L3: 代码实现] ──→ [模型解释文档]
+                        辩论循环           Agentic 循环          (技术说明, 非论文)
+                                             │ (L1 判需敏感性时)
+                                             ▼
+                                        [L5: 敏感性分析]
 ```
 
 ## 快速开始
@@ -57,6 +68,10 @@ Layer 4: 论文写作（2 Agent，Agentic Tool Calling）
 Layer 5: 敏感性分析（3 Agent，可选）
   ParamPerturber → RobustnessAnalyst → SensitivityManager
   产出：参数稳定性评估
+
+模型解释层（explanation，1 Agent，恢复模式 --from-layer1 专用）
+  Explainer：面向团队的技术说明文档（建模思路/公式/求解/结果/敏感性结论）
+  产出：model_explanation.md（非竞赛论文格式）
 ```
 
 ### Layer 3 & 4 的核心创新：Agentic Tool Calling
@@ -156,14 +171,15 @@ Layer 3 的 SolverAgent 可自主调用 `web_search` 查询数据字段含义、
 - **L1/L2/L5**：传统 LLM 节点链（System Prompt → 单次调用 → 输出）
 - **L3 SolverAgent**：有 `run_code` / `read_file` / `write_file` / `list_dir` / `web_search` 工具的 Agentic 循环（写→跑→修，最多 30 轮），VizAgent 负责图表生成
 - **L4 PaperAgent**：有 `read_file` / `list_dir` / `write_file` 工具的 Agentic 循环（逐节写→核实→改，最多 30 轮）
-- **总 Agent 数**：16（L1: 4, L2: 4, L3: 3, L4: 2, L5: 3）
+- **总 Agent 数**：17（L1: 4, L2: 4, L3: 3, L4: 2, L5: 3, 模型解释: 1）
 
 ### 关键文件地图
 
 | 文件 | 作用 | 什么时候看 |
 |------|------|-----------|
 | `mathmodelingagents/graph/setup.py` | 图拓扑定义（节点、边、路由） | 修改 Agent 编排流程 |
-| `mathmodelingagents/graph/conditional_logic.py` | 条件路由（辩论继续/结束、重试/通过） | 修改裁决逻辑 |
+| `mathmodelingagents/graph/conditional_logic.py` | 条件路由（辩论继续/结束、重试/通过、恢复模式路由） | 修改裁决逻辑 |
+| `mathmodelingagents/graph/recovery.py` | Layer 1 状态恢复（--from-layer1） | 修改恢复模式 |
 | `mathmodelingagents/agents/__init__.py` | Agent 工厂函数（含 Tool Calling 循环） | 修改 Agent 行为、添加工具 |
 | `mathmodelingagents/agents/utils/prompt_templates.py` | 全部 System Prompt（纯静态，可缓存） | 修改 Agent 指令 |
 | `mathmodelingagents/tools/__init__.py` | 沙盒执行 + LangChain Tool 封装 | 修改/添加工具 |
@@ -193,6 +209,9 @@ python main.py problem_2024a.md --provider volcengine
 
 # 启用敏感性分析
 python main.py problem_2024a.md -s
+
+# 恢复模式：从已完成的 Layer 1 数据出发，只跑 L2→L3(+L5) 产出模型解释文档
+python main.py problem_2024a.md --from-layer1 <已有输出目录>
 ```
 
 ### 修改 Prompt 的正确方式
@@ -290,11 +309,13 @@ python main.py <题目文件> [选项]
   --max-rounds, -r N    每层最大辩论轮次（默认 10）
   --provider, -p        指定 LLM provider（opencode / deepseek / volcengine / volcengine-plan）
   --start-layer N       从第 N 层开始（1-5，调试用）
+  --from-layer1 DIR     从已完成的 Layer 1 输出目录恢复，只跑 L2→L3(+L5) 产出模型解释文档（与 --start-layer 互斥）
 
 示例:
   python main.py problem_2024a.md
   python main.py problem_2024a.md -s -o my_solution
   python main.py problem_2024a.md --start-layer 4    # 只重跑论文
+  python main.py problem_2024a.md --from-layer1 results/problem_2024a   # 恢复模式，产出模型解释文档
 ```
 
 ## 项目结构
@@ -326,7 +347,8 @@ MathModelingAgents/
     │   ├── setup.py                 # LangGraph StateGraph 构建
     │   ├── modeling_graph.py        # 主入口类 MathModelingGraph
     │   ├── conditional_logic.py     # 辩论/重试/循环路由
-    │   └── propagation.py           # 初始状态 + 图执行参数
+    │   ├── propagation.py           # 初始状态 + 图执行参数
+    │   └── recovery.py              # Layer 1 状态恢复（--from-layer1）
     │
     └── reporting.py                 # 增量写盘 + 最终报告汇总
 ```

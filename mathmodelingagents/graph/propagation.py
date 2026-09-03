@@ -33,12 +33,15 @@ class Propagator:
         self,
         problem_path: str,
         output_name: str | None = None,
+        overrides: dict | None = None,
     ) -> dict[str, Any]:
         """创建初始 AgentState，包含所有层的默认值。
 
         Args:
             problem_path: 题目 Markdown 文件路径。
             output_name: 输出文件夹名。为 None 时自动生成。
+            overrides: 恢复场景下覆盖初始状态的字段（如 problem_report /
+                sensitivity_enabled / sensitivity_reason）。只覆盖存在的键。
 
         Returns:
             初始化的 AgentState 字典。
@@ -116,6 +119,14 @@ class Propagator:
         }
 
         logger.info(f"初始状态已创建: problem={problem_file.name}, output={output_name}")
+
+        if overrides:
+            # 只放行 AgentState 的合法字段（基础 dict 未预置 sensitivity_enabled
+            # 等键，恢复流程需要能注入它们）
+            allowed = set(AgentState.__annotations__)
+            state.update({k: v for k, v in overrides.items() if k in allowed})
+            logger.info(f"初始状态已应用 overrides 字段: {sorted(overrides.keys())}")
+
         return state  # type: ignore[return-value]
 
     def get_graph_args(self) -> dict[str, Any]:

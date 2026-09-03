@@ -1,4 +1,5 @@
-"""默认配置 — 对标 TradingAgents 的 default_config.py。
+"""
+默认配置 — 对标 TradingAgents 的 default_config.py。
 
 敏感信息（API Key）和通用设置（模型名、超时等）全部通过 .env 管理。
 .env 文件读取后由 MATHMODELING_ 前缀的环境变量覆盖。
@@ -94,6 +95,10 @@ _DEFAULT_LAYER_MODEL_OVERRIDES: dict = {
     "sensitivity": {
         "agent": "deepseek-v4-flash",
         "manager": "deepseek-v4-pro",
+    },
+    # ── 模型解释文档（explain 模式）──
+    "explanation": {
+        "agent": "deepseek-v4-pro",
     },
 }
 

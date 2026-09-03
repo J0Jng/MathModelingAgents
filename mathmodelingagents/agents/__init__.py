@@ -82,6 +82,39 @@ def _run_sensitivity_decision(config: dict, problem_report: str) -> tuple[bool, 
         return True, f"决策调用失败（{e}），fail-open 默认执行"
 
 
+def _persist_sensitivity_decision(config: dict, enabled: bool, reason: str) -> None:
+    """把 Layer 1 敏感性决策落盘到 `<output_dir>/sensitivity_decision.json`。
+
+    供 `--from-layer1` 恢复流程读取（ADR-0001 配套，D2 方案 B）。
+    output_dir 缺失或写入失败只 warning，不影响主流程。
+
+    Args:
+        config: 全局配置（读取 output_dir 与 sensitivity_mode）。
+        enabled: 是否启用敏感性分析。
+        reason: 决策理由。
+    """
+    import json
+    from datetime import datetime
+    from pathlib import Path
+
+    output_dir = config.get("output_dir", "")
+    if not output_dir:
+        logger.warning("[problem] 敏感性决策未落盘: config 未设置 output_dir")
+        return
+    payload = {
+        "enabled": bool(enabled),
+        "reason": str(reason),
+        "mode": resolve_sensitivity_mode(config),
+        "generated_at": datetime.now().isoformat(),
+    }
+    try:
+        path = Path(output_dir) / "sensitivity_decision.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info(f"[problem] 敏感性决策已落盘: {path}")
+    except OSError as e:
+        logger.warning(f"[problem] 敏感性决策落盘失败（不影响主流程）: {e}")
+
+
 def _extract_final_output(messages: list) -> str:
     """从消息列表中提取最后一个非工具调用的文本输出。
 
@@ -800,6 +833,7 @@ def _make_manager_node(
                 enabled, reason = _run_sensitivity_decision(config, result)
                 updates["sensitivity_enabled"] = enabled
                 updates["sensitivity_reason"] = reason
+                _persist_sensitivity_decision(config, enabled, reason)
                 print(f"[problem] 敏感性决策: {'✅ 启用' if enabled else '⏭️ 跳过'} - {reason}", flush=True)
 
         # 根据层写入特定字段
@@ -1411,6 +1445,14 @@ def create_sensitivity_manager(config: dict) -> Callable[[AgentState], dict[str,
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Explanation: 模型解释文档（explain 模式）
+# ═══════════════════════════════════════════════════════════════════
+
+def create_explainer(config: dict) -> Callable[[AgentState], dict[str, Any]]:
+    return _make_llm_node(config, "explainer", "explanation", "agent", "explanation_doc")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Utility
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1432,5 +1474,6 @@ __all__ = [
     "create_paper_agent", "create_paper_manager",
     "create_param_perturber", "create_robustness_analyst",
     "create_sensitivity_manager",
+    "create_explainer",
     "create_msg_delete",
 ]

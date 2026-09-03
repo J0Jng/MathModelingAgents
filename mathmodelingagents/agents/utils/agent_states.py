@@ -72,6 +72,9 @@ class AgentState(TypedDict, total=False):
     paper_feedback: str       # PaperManager REVISE 时的审查意见
     paper_messages: list
 
+    # ═══ 模型解释文档（explain 模式）═══
+    explanation_doc: str
+
     # ═══ Layer 5 产出 ═══
     sensitivity_scan: str
     sensitivity_report: str

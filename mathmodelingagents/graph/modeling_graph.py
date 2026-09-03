@@ -79,6 +79,7 @@ class MathModelingGraph:
         self,
         problem_path: str,
         output_name: str | None = None,
+        initial_state_overrides: dict | None = None,
     ) -> tuple[dict[str, Any], str]:
         """运行完整的数学建模流程（流式 + 增量写盘）。
 
@@ -88,6 +89,9 @@ class MathModelingGraph:
         Args:
             problem_path: 题目 Markdown 文件路径。
             output_name: 输出文件夹名。为 None 时自动生成。
+            initial_state_overrides: 恢复场景下覆盖初始状态的字段
+                （如 --from-layer1 注入 problem_report），透传给
+                create_initial_state。
 
         Returns:
             (final_state, final_paper) 元组。
@@ -105,6 +109,7 @@ class MathModelingGraph:
         initial_state = self.propagator.create_initial_state(
             problem_path=str(problem_file.resolve()),
             output_name=output_name,
+            overrides=initial_state_overrides,
         )
 
         # ── 确定输出目录 ──

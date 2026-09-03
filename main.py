@@ -178,8 +178,19 @@ def main():
         choices=[1, 2, 3, 4, 5],
         help="从指定层开始执行，跳过前面的层（默认: 1）",
     )
+    parser.add_argument(
+        "--from-layer1",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="从已完成的 Layer 1 输出目录恢复，只跑 L2→L3(+L5) 并生成模型解释文档（与 --start-layer 互斥）",
+    )
 
     args = parser.parse_args()
+
+    # 互斥校验：--from-layer1 与 --start-layer 不能同时显式指定
+    if args.from_layer1 and args.start_layer != 1:
+        parser.error("--from-layer1 与 --start-layer 互斥，不能同时指定")
 
     # 验证输入文件
     problem_path = Path(args.problem_path)
@@ -201,6 +212,23 @@ def main():
     # 输出名
     output_name = args.output or problem_path.stem
 
+    # --from-layer1：从既有 Layer 1 输出恢复，只跑 L2→L3(+L5) 产出模型解释文档
+    recovered: dict | None = None
+    if args.from_layer1:
+        from mathmodelingagents.graph.recovery import load_layer1_state
+
+        recovered = load_layer1_state(args.from_layer1)
+        # 旧目录可能没有敏感性决策落盘：重新判定一次（内存使用，随流程传递）
+        if "sensitivity_enabled" not in recovered:
+            from mathmodelingagents.agents import _run_sensitivity_decision
+
+            enabled, reason = _run_sensitivity_decision(config, recovered["problem_report"])
+            recovered["sensitivity_enabled"] = enabled
+            recovered["sensitivity_reason"] = reason
+        config["selected_layers"] = [2, 3]
+        config["explain_mode"] = True
+        output_name = args.output or f"{problem_path.stem}_explain"
+
     from mathmodelingagents.default_config import resolve_sensitivity_mode
     sensitivity_mode = resolve_sensitivity_mode(config)
 
@@ -220,12 +248,19 @@ def main():
     mm = MathModelingGraph(config=config, debug=True)
 
     print("[Layer 0] 开始分析问题...")
-    state, final_paper = mm.propagate(
-        problem_path=str(problem_path),
-        output_name=output_name,
-    )
-
-    print(f"\\n✅ 完成！论文已输出到: {config.get('output_dir')}")
+    if recovered is not None:
+        mm.propagate(
+            problem_path=str(problem_path),
+            output_name=output_name,
+            initial_state_overrides=recovered,
+        )
+        print(f"\\n✅ 完成！模型解释文档已输出到: {config.get('output_dir')}")
+    else:
+        mm.propagate(
+            problem_path=str(problem_path),
+            output_name=output_name,
+        )
+        print(f"\\n✅ 完成！论文已输出到: {config.get('output_dir')}")
 
     # 代码验证：实际执行 Layer 3 代码块
     output_dir = config.get("output_dir", "")

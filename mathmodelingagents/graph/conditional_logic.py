@@ -64,6 +64,7 @@ class ConditionalLogic:
         max_impl_retries: int = 3,
         selected_layers: list[int] | None = None,
         sensitivity_mode: str = "auto",
+        explain_mode: bool = False,
     ):
         """初始化路由逻辑。
 
@@ -76,6 +77,7 @@ class ConditionalLogic:
             max_impl_retries: 实现重试最大次数。
             selected_layers: 用户选择的层列表，默认 [1,2,3,4]。
             sensitivity_mode: 敏感性模式（auto/always/never，ADR-0001），默认 auto。
+            explain_mode: 解释模式（--from-layer1）：L3(+L5) 后产出模型解释文档而非论文。
         """
         self.max_debate_rounds = max_debate_rounds  # deprecated
         self.max_problem_rounds = max_problem_rounds
@@ -85,6 +87,7 @@ class ConditionalLogic:
         self.max_impl_retries = max_impl_retries
         self.selected_layers = selected_layers or [1, 2, 3, 4]
         self.sensitivity_mode = sensitivity_mode
+        self.explain_mode = explain_mode
 
     def _sensitivity_active(self, state: AgentState) -> bool:
         """运行时敏感性闸门（真值表见 sensitivity_active，共用实现）。"""
@@ -239,14 +242,18 @@ class ConditionalLogic:
     # ═══════════════════════════════════════════════════════════════
 
     def should_continue_sensitivity(self, state: AgentState) -> str:
-        """Sensitivity 结束后：进入 Layer 4 论文写作或结束。
+        """Sensitivity 结束后：进入模型解释（explain 模式）、Layer 4 论文写作或结束。
 
         Args:
             state: 当前全局 AgentState。
 
         Returns:
+            "explainer" 进入模型解释层（explain 模式），
             "paper_agent" 进入论文层，或 END。
         """
+        if self.explain_mode:
+            logger.info("Layer 5 -> 模型解释: explain 模式，撰写模型解释文档")
+            return "explainer"
         if 4 in self.selected_layers:
             logger.info("Layer 5 -> Layer 4: 敏感性分析完成，进入论文写作")
             return "paper_agent"
@@ -254,10 +261,11 @@ class ConditionalLogic:
         return END
 
     def _route_after_impl(self, state: AgentState) -> str:
-        """clear_impl 后决定：敏感性分析（启用时前置）、论文写作或结束。
+        """clear_impl 后决定：敏感性分析（启用时前置）、模型解释、论文写作或结束。
 
         敏感性分析层前置于论文层（ADR-0002）：启用时 L3 -> L5 -> L4，
         敏感性结果随跨层摘要进入论文层；禁用时 L3 -> L4 -> END。
+        解释模式（--from-layer1）下 L3(+L5) 之后进入模型解释层而非论文层。
 
         Args:
             state: 当前全局 AgentState。
@@ -268,6 +276,9 @@ class ConditionalLogic:
         if self._sensitivity_active(state):
             logger.info("Layer 3 -> Layer 5: 敏感性分析已启用，前置执行")
             return "param_perturber"
+        if self.explain_mode:
+            logger.info("Layer 3 → 模型解释: explain 模式，撰写模型解释文档")
+            return "explainer"
         if 4 in self.selected_layers:
             logger.info("Layer 3 → Layer 4: 进入论文写作")
             return "paper_agent"
