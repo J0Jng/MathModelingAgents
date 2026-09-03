@@ -39,3 +39,28 @@ def test_build_options_realtime_fallback_and_custom(monkeypatch):
     opts = model_picker._build_options("volcengine", "deep")
     ids = [mid for _, mid in opts]
     assert ids.count("custom") == 1 and "ark-code-latest" in ids
+
+
+def test_apply_non_deepseek_overwrites_everything():
+    original = {
+        "layer_model_overrides": {
+            "problem": {"agent": "x", "manager": "y"},
+            "implementation": {"coder": "kimi", "manager": "z"},
+            "paper": {"writer": "qwen", "manager": "w"},
+        },
+        "provider_layer_model_overrides": {
+            "volcengine-plan": {"implementation": {"coder": "kimi-k2.7-code"}, "paper": {"writer": "minimax-m3"}},
+        },
+        "provider_model_aliases": {"volcengine-plan": {"qwen3.7-max": "minimax-m3"}},
+    }
+    new = _apply_model_selection(original, "volcengine-plan", {"quick": "q", "deep": "d"})
+    # 交互选中模型作为最高优先级：所有层的 manager/writer/coder 等重角色被 deep 覆盖
+    assert new["layer_model_overrides"]["problem"]["manager"] == "d"
+    assert new["layer_model_overrides"]["implementation"]["coder"] == "d"  # 覆盖 provider 硬编码的 kimi
+    assert new["layer_model_overrides"]["paper"]["writer"] == "d"          # 覆盖 provider 硬编码的 minimax-m3
+    # 端到端：经 get_layer_model 真实解析后交互选择仍然生效（pv 级冲突角色已被清理）
+    new["llm_provider"] = "volcengine-plan"
+    from mathmodelingagents.llm_clients import get_layer_model
+    assert get_layer_model(new, "implementation", "coder") == "d"
+    assert get_layer_model(new, "paper", "writer") == "d"
+    assert get_layer_model(new, "problem", "agent") == "q"

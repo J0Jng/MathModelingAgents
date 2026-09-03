@@ -102,31 +102,47 @@ def prompt_model_selection(config: dict) -> dict:
 def _apply_model_selection(config: dict, provider: str, chosen: dict) -> dict:
     """把 chosen={'quick':..,'deep':..} 应用到 config 副本，返回修改后的副本。
 
-    非 deepseek provider：覆盖 layer_model_overrides 里各层的 agent/coder/writer 等
-    角色为所选模型（保持 provider_layer_model_overrides 可能存在的角色覆盖不被抹掉，
-    仅当全局覆盖命中时才改写）。deepseek：覆盖 deep_think_llm / quick_think_llm。
+    交互选中模型为最高优先级 —— 遍历 layer_model_overrides 中每个 layer 的每个
+    角色：deep 角色集 → chosen['deep']，否则 chosen['quick']。同时清空/归并
+    provider_layer_model_overrides 中与该层冲突的 provider 级角色（交互覆盖一切），
+    并移除 provider_model_aliases 中会改写所选模型的条目（保证所选模型真实生效）。
+    deepseek provider：直接设 deep_think_llm / quick_think_llm。空 config 防御。
     """
     new = dict(config)
-    if provider == "deepseek":
-        new = dict(config)
-        if chosen.get("deep"):
-            new["deep_think_llm"] = chosen["deep"]
-        if chosen.get("quick"):
-            new["quick_think_llm"] = chosen["quick"]
-        return new
-
-    # 非 deepseek：改写 layer_model_overrides 中出现的所有角色值为所选模型，
-    # 但保留 provider 级角色覆盖（provider_layer_model_overrides）优先。实现时注意
-    # 空 config 防御：layer_model_overrides 可能未存在，或用默认 DEFAULT_CONFIG。
     quick = chosen.get("quick")
     deep = chosen.get("deep")
-    overrides = dict(config.get("layer_model_overrides") or {})
-    for layer, roles in overrides.items():
-        roles = dict(roles)
+
+    if provider == "deepseek":
+        if deep:
+            new["deep_think_llm"] = deep
+        if quick:
+            new["quick_think_llm"] = quick
+        return new
+
+    # 非 deepseek：逐 layer 逐角色完全覆盖
+    layer_overrides = {
+        layer: dict(roles) for layer, roles in (config.get("layer_model_overrides") or {}).items()
+    }
+    for layer, roles in layer_overrides.items():
         for role in list(roles):
+            # 决定用 deep 还是 quick：deep 角色集优先；其他(如纯 agent)用 quick
             replacement = deep if role in _DEEP_ROLES else quick
             if replacement:
                 roles[role] = replacement
-        overrides[layer] = roles
-    new["layer_model_overrides"] = overrides
+
+    # 交互选择最高优先级：移除 provider 级覆盖中与所选深度冲突的角色，避免被回盖
+    # （get_layer_model 中 provider 级覆盖后合并胜出，不移除则交互选择形同虚设）
+    pv_overrides = {
+        p: {layer: dict(roles) for layer, roles in layers.items()}
+        for p, layers in (config.get("provider_layer_model_overrides") or {}).items()
+    }
+    if provider in pv_overrides:
+        pv = pv_overrides[provider]
+        for layer, roles in pv.items():
+            for role in list(roles):
+                if role in _DEEP_ROLES:
+                    roles.pop(role, None)  # 深度角色由交互 deep 接管
+
+    new["layer_model_overrides"] = layer_overrides
+    new["provider_layer_model_overrides"] = pv_overrides
     return new
