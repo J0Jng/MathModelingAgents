@@ -44,6 +44,24 @@ python main.py problem_2024a.md
 
 运行结束后，桌面上会出现一个文件夹，里面是完整的数学建模论文和所有中间结果。
 
+### 交互式模型选择
+
+`python main.py 题目.md` 交互模式下，配置组装后会先弹出两个模型选择菜单（菜单项优先实时拉取当前 provider 的 `/models` 端点，失败时降级到内置静态清单，末尾恒有 `Custom model ID` 兜底）：
+
+```
+Select Your [Quick-Thinking] LLM Engine (volcengine-plan):   # 快速思考模型
+Select Your [Deep-Thinking] LLM Engine (volcengine-plan):    # 深度思考模型
+```
+
+选中的 quick/deep 模型作为**最高优先级**完全覆盖 provider 级角色硬编码（如 volcengine-plan 的 L3 coder / L4 writer），写回 config 后再启动建模流程。
+
+| 环境变量 | 作用 |
+|---------|------|
+| `MATHMODELING_QUICK_THINK_LLM` | 设置后跳过快速思考模型交互，直接使用该值 |
+| `MATHMODELING_DEEP_THINK_LLM` | 设置后跳过深度思考模型交互，直接使用该值 |
+
+> 设任一 env 变量即跳过对应交互；**两个都设置 = 完全跳过交互**，适合 CI / 脚本 / 无 TTY 环境。provider 未知或交互异常时自动走默认模型，绝不阻塞。
+
 ## 架构
 
 框架分为 5 层，层与层之间只传递精华摘要而非原始输出。

@@ -163,6 +163,12 @@ VOLCENGINE_PLAN_API_KEY=...         # volcengine-plan (Agent Plan，订阅后从
 # 覆盖各层模型（JSON，深合并到代码默认值）
 MATHMODELING_LAYER_MODEL_OVERRIDES={"paper":{"writer":"qwen3.7-max"}}
 
+# 跳过 CLI 交互式模型选择（设置任一即跳过对应菜单；两个都设 = 完全跳过交互，
+# 适合 CI / 脚本 / 无 TTY。交互模式下菜单优先实时拉取 provider 的 /models 端点，
+# 失败降级到 cli/model_catalog.py 静态清单，选中值最高优先级完全覆盖 provider 级硬编码）
+MATHMODELING_QUICK_THINK_LLM=deepseek-v4-flash
+MATHMODELING_DEEP_THINK_LLM=deepseek-v4-pro
+
 # 其他常用
 MATHMODELING_MAX_MODELING_ROUNDS=5
 MATHMODELING_MAX_REVISION_ROUNDS=8
