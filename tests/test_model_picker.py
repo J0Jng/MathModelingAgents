@@ -54,6 +54,35 @@ def test_build_options_realtime_fallback_and_custom(monkeypatch):
     assert ids.count("custom") == 1 and "ark-code-latest" in ids
 
 
+def test_modeler_roles_go_deep_not_quick():
+    # modeling 层的 agent 是 modeler_*（数学建模师），应归 deep（与 default_config L2=pro 一致），
+    # 而非普通 quick。L1/L5 的 agent 仍归 quick。
+    original = {
+        "layer_model_overrides": {
+            "problem": {"agent": "x", "manager": "y"},
+            "modeling": {"agent": "z", "manager": "w"},
+            "sensitivity": {"agent": "s", "manager": "m"},
+            "explanation": {"agent": "e"},
+        },
+    }
+    new = _apply_model_selection(original, "opencode", {"quick": "q", "deep": "d"})
+    # modeler (modeling.agent) -> deep
+    assert new["layer_model_overrides"]["modeling"]["agent"] == "d"
+    # L1/L5 agent -> quick
+    assert new["layer_model_overrides"]["problem"]["agent"] == "q"
+    assert new["layer_model_overrides"]["sensitivity"]["agent"] == "q"
+    # explainer (explanation.agent) -> quick
+    assert new["layer_model_overrides"]["explanation"]["agent"] == "q"
+    # managers -> deep
+    assert new["layer_model_overrides"]["modeling"]["manager"] == "d"
+    assert new["layer_model_overrides"]["problem"]["manager"] == "d"
+    # 端到端：经 get_layer_model 真实解析
+    new["llm_provider"] = "opencode"
+    from mathmodelingagents.llm_clients import get_layer_model
+    assert get_layer_model(new, "modeling", "agent") == "d"
+    assert get_layer_model(new, "problem", "agent") == "q"
+
+
 def test_apply_non_deepseek_overwrites_everything():
     original = {
         "layer_model_overrides": {

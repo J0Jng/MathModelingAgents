@@ -20,8 +20,12 @@ logger = logging.getLogger(__name__)
 
 console = Console()
 
-# 角色 → 思考深度分类（仅用于本模块内部）。
+# 角色 → 思考深度分类（用于 _apply_model_selection）。
+# manager/writer/coder/algorithm 归 deep；其余 agent 归 quick。
 _DEEP_ROLES = {"manager", "writer", "coder", "algorithm"}
+# modeling 层的 agent 即 modeler_*（数学建模师），需深度数学推理 → 归 deep，
+# 而非普通 quick。这与 default_config 的 L2 modeling agent=deepseek-v4-pro 一致。
+_MODELING_AGENT_IS_DEEP = True
 
 # 允许通过环境变量跳过交互（显式设置才跳过）。
 # 注意：不加 read QUICK/DEEP_THINK_LLM —— 那俩只当默认模型值，不能隐式关闭交互。
@@ -125,8 +129,10 @@ def _apply_model_selection(config: dict, provider: str, chosen: dict) -> dict:
     }
     for layer, roles in layer_overrides.items():
         for role in list(roles):
-            # 决定用 deep 还是 quick：deep 角色集优先；其他(如纯 agent)用 quick
-            replacement = deep if role in _DEEP_ROLES else quick
+            # 决定用 deep 还是 quick：deep 角色集优先；modeling 层的 agent(modeler) 也归 deep；
+            # 其余(如 L1/L5 agent、explainer)用 quick
+            is_modeler = _MODELING_AGENT_IS_DEEP and layer == "modeling" and role == "agent"
+            replacement = deep if (role in _DEEP_ROLES or is_modeler) else quick
             if replacement:
                 roles[role] = replacement
 
