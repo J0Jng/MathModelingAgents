@@ -139,6 +139,37 @@ def _verify_layer3_code(output_dir: str) -> str:
     return report
 
 
+def build_config_from_args(args) -> dict:
+    """CLI 参数 → config 组装（含交互式模型选择）。可测：交互函数经 cli.model_picker 注入。"""
+    config = DEFAULT_CONFIG.copy()
+    if args.provider:
+        config["llm_provider"] = args.provider
+    config["max_debate_rounds"] = args.max_rounds
+    config["max_modeling_rounds"] = args.max_rounds
+    config["max_revision_rounds"] = args.max_rounds
+    if args.sensitivity:
+        config["sensitivity_mode"] = args.sensitivity
+    config["selected_layers"] = list(range(args.start_layer, 5))
+
+    # ── CLI 交互式模型（agent）选择 ──
+    try:
+        from cli.model_picker import prompt_model_selection
+        selection = prompt_model_selection(config)
+        if selection:
+            from cli.model_picker import _apply_model_selection
+            config = _apply_model_selection(config, config["llm_provider"], selection)
+    except Exception as exc:  # 交互层任何异常都不应阻断建模
+        import logging
+        logging.getLogger("main").warning("交互模型选择失败，使用默认模型: %s", exc)
+
+    # --from-layer1：从既有 Layer 1 输出恢复，只跑 L2→L3(+L5) 产出模型解释文档
+    if args.from_layer1:
+        config["selected_layers"] = [2, 3]
+        config["explain_mode"] = True
+
+    return config
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MathModelingAgents — 多智能体数学建模竞赛框架"
@@ -198,16 +229,8 @@ def main():
         print(f"错误: 文件不存在: {args.problem_path}")
         sys.exit(1)
 
-    # 配置
-    config = DEFAULT_CONFIG.copy()
-    if args.provider:
-        config["llm_provider"] = args.provider
-    config["max_debate_rounds"] = args.max_rounds
-    config["max_modeling_rounds"] = args.max_rounds
-    config["max_revision_rounds"] = args.max_rounds
-    if args.sensitivity:
-        config["sensitivity_mode"] = args.sensitivity
-    config["selected_layers"] = list(range(args.start_layer, 5))
+    # 配置组装 + 交互式模型选择
+    config = build_config_from_args(args)
 
     # 输出名
     output_name = args.output or problem_path.stem
@@ -225,8 +248,6 @@ def main():
             enabled, reason = _run_sensitivity_decision(config, recovered["problem_report"])
             recovered["sensitivity_enabled"] = enabled
             recovered["sensitivity_reason"] = reason
-        config["selected_layers"] = [2, 3]
-        config["explain_mode"] = True
         output_name = args.output or f"{problem_path.stem}_explain"
 
     from mathmodelingagents.default_config import resolve_sensitivity_mode
@@ -237,6 +258,8 @@ def main():
 ║       MathModelingAgents v0.1.0               ║
 ╠══════════════════════════════════════════════╣
 ║  Provider:  {config['llm_provider']:<34}║
+║  Quick:     {config.get('quick_think_llm', '-'):<34}║
+║  Deep:      {config.get('deep_think_llm', '-'):<34}║
 ║  Problem:   {problem_path.name:<34}║
 ║  Output:    {output_name:<34}║
 ║  Sensitivity: {sensitivity_mode:<33}║
