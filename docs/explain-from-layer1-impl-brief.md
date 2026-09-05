@@ -6,7 +6,7 @@
 
 当前框架的两个结构性缺口（已读源码确认）：
 1. **Layer 1 的敏感性决策不落盘**：`_run_sensitivity_decision()`（`agents/__init__.py:41`）结果只写内存 state 的 `sensitivity_enabled` / `sensitivity_reason`（`agents/__init__.py:797-803`），不写任何文件。所以「已存在的 Layer1 数据」里目前没有这个决策。
-2. **`--start-layer 2` 无法继承 Layer 1 产出**：`create_initial_state()`（`propagation.py:32`）把 `problem_report` 初始化为空串，跳过 L1 时 L2 拿不到问题分析。
+2. **`--from-layer1` 继承 Layer 1 产出**：相较旧 `--start-layer 2`（该参数已移除）通过 `create_initial_state()`（`propagation.py:32`）把 `problem_report` 初始化为空串、跳过 L1 时 L2 拿不到问题分析，`--from-layer1` 从磁盘恢复 `problem_report`。
 
 ## 设计决策（Design）
 
@@ -16,8 +16,7 @@ python main.py <题目.md> --from-layer1 <已有输出目录> [--output <新输�
 ```
 - `<题目.md>` 仍是必填 positional 参数：提供 `problem_description`（题目原文），因为 `Layer1_问题分析.md` 文件里不保存题目原文。
 - `--from-layer1`：读 `<dir>/Layer1_问题分析.md` 提取 Layer 1 分析结果，注入 `problem_report`。
-- 与 `--start-layer` 互斥（argparse 校验：两者同时给则报错退出）。
-- 隐含语义：`selected_layers = [2, 3]`（不含 4），`explain_mode = True`，`sensitivity_mode` 保持 `auto`（尊重恢复的决策）。
+- `--from-layer1` 隐含语义：`selected_layers = [2, 3]`（不含 4），`explain_mode = True`，`sensitivity_mode` 保持 `auto`（尊重恢复的决策）。
 - 默认 `output_name`：`<题目stem>_explain`（若用户未给 `--output`），避免与已有目录重名。
 
 ### D2. 敏感性决策持久化 + 恢复（方案 B+A）
@@ -104,7 +103,6 @@ START → modeler_a → ... → modeling_manager → solver_agent → impl_manag
 
 ### 10. `main.py`
 - 新增 argparse 参数 `--from-layer1`（`type=str, default=None, metavar="DIR"`）。
-- 校验：`--from-layer1` 与 `--start-layer` 同时给则 `parser.error(...)` 退出。
 - 当 `--from-layer1` 给定时：
   - `from mathmodelingagents.graph.recovery import load_layer1_state`，`recovered = load_layer1_state(args.from_layer1)`。
   - 若 recovered 无 `sensitivity_enabled`：调 `from mathmodelingagents.agents import _run_sensitivity_decision` 重新判定（传入 `config` 与 `recovered["problem_report"]`），把 enabled/reason 写入 recovered（并可用 `_persist_sensitivity_decision` 落盘到新目录；若落盘目标目录尚未确定，可在 output_dir 确定后再落盘，或直接略过落盘——重新判定结果也随本流程内存使用即可）。
@@ -147,7 +145,7 @@ START → modeler_a → ... → modeling_manager → solver_agent → impl_manag
 - **不修改 `.env` / `.env.example` / `default_config.py` 的 provider 配置块**（除 D3 的 `_DEFAULT_LAYER_MODEL_OVERRIDES` 新增一条）。
 - **不写 README 之外的文档**（本任务书就是唯一新增设计文档）。
 - **不重构 `_run_tool_loop` / `_make_llm_node` / `_make_manager_node`**：explainer 直接复用 `_make_llm_node`。
-- **不改变 `--start-layer` 现有行为**。
+- **不改变 `--from-layer1` 现有行为**。
 - **不提交、不 push**：只编辑文件，git 操作由 Hermes 后续处理。
 
 ## 环境注意（Windows 陷阱，务必遵守）

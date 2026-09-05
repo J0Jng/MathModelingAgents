@@ -41,17 +41,13 @@ def test_skip_prompt_is_the_only_skip(monkeypatch):
     assert not _skip_prompt_requested()
 
 
-def test_build_options_realtime_fallback_and_custom(monkeypatch):
+def test_build_options_uses_official_catalog_only(monkeypatch):
+    # 菜单 = 官方静态清单，不再追加 Custom
     from cli import model_picker
-    # 拉取成功 → 使用实时列表，并追加 Custom 兜底
-    monkeypatch.setattr(model_picker, "fetch_models", lambda p: ["m-a", "m-b"])
-    opts = model_picker._build_options("volcengine", "deep")
-    assert opts == [("m-a", "m-a"), ("m-b", "m-b"), ("Custom model ID", "custom")]
-    # 拉取失败 → 降级静态清单（自带 Custom，不重复追加）
-    monkeypatch.setattr(model_picker, "fetch_models", lambda p: [])
     opts = model_picker._build_options("volcengine", "deep")
     ids = [mid for _, mid in opts]
-    assert ids.count("custom") == 1 and "ark-code-latest" in ids
+    assert "ark-code-latest" in ids
+    assert "custom" not in ids
 
 
 def test_modeler_roles_go_deep_not_quick():

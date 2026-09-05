@@ -18,8 +18,8 @@ python main.py 题目.md --provider volcengine --max-rounds 2
 # 火山方舟 Agent Plan（订阅套餐 Key）
 python main.py 题目.md --provider volcengine-plan --max-rounds 2
 
-# 从中间层开始（调试用）
-python main.py 题目.md --provider opencode --start-layer 2
+# 恢复模式：从已完成的 Layer 1 数据出发，只跑 L2→L3(+L5) 产出模型解释文档
+python main.py 题目.md --provider opencode --from-layer1 <已有输出目录>
 ```
 
 ---
@@ -198,4 +198,4 @@ MATHMODELING_SENSITIVITY_MODE=auto     # auto / always / never
 | 正式比赛（高质量） | `--provider opencode --max-rounds 3` | ~90-120 min |
 | 火山方舟 Agent Plan | `--provider volcengine-plan --max-rounds 2` | ~60-90 min |
 | 火山方舟 Coding Plan | `--provider volcengine --max-rounds 2` | ~60-90 min |
-| 调试某层 | `--provider opencode --start-layer N` | 仅该层耗时 |
+| 调试某层 | `--provider opencode --from-layer1 <dir>`（L1 已完成） | 仅后续层耗时 |

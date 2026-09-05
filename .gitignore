@@ -19,6 +19,9 @@ results/
 cache/
 code/
 
+# 模型知识库 RAG — embedding 模型文件（91MB，二进制，README 已写镜像下载方式）
+mathmodelingagents/knowledge/models/
+
 # IDE / 工具
 .vscode/
 .idea/

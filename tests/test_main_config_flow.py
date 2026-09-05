@@ -17,7 +17,6 @@ def _args(**kw) -> argparse.Namespace:
         sensitivity=None,
         max_rounds=10,
         provider=None,
-        start_layer=1,
         from_layer1=None,
     )
     base.update(kw)

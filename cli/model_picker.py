@@ -1,8 +1,8 @@
 """CLI 交互式模型（agent）选择器。
 
-在 main.py 进入 propagate() 之前调用。根据 config["llm_provider"] 决定是否
-弹出两个 questionary.select（Quick-Thinking / Deep-Thinking）。选中 Custom 时
-二级输入模型 ID。返回「变更字典」交给调用方写回 config，本模块不直接改 config。
+在 main.py 进入 propagate() 之前调用。根据 config[\"llm_provider\"] 决定是否
+弹出两个 questionary.select（Quick-Thinking / Deep-Thinking）。返回「变更字典」
+交给调用方写回 config，本模块不直接改 config。
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ import questionary
 from rich.console import Console
 
 from cli.model_catalog import MODEL_OPTIONS, get_model_options  # 静态降级清单
-from cli.model_fetcher import fetch_models  # 实时拉取
 
 logger = logging.getLogger(__name__)
 
@@ -39,17 +38,15 @@ def _skip_prompt_requested() -> bool:
 
 
 def _build_options(provider: str, mode: str) -> list[tuple[str, str]]:
-    """菜单项：优先实时拉取，失败降级静态清单，末尾恒有 Custom。"""
-    realtime = fetch_models(provider)
-    if realtime:
-        # 实时列表：可为空但非空时全部展示；deep/quick 暂不区分(模型自含思考能力)
-        options = [(m, m) for m in realtime]
-    else:
-        options = list(get_model_options(provider, mode))
-    # 始终追加 Custom 兜底,去重
-    if not any(mid == "custom" for _, mid in options):
-        options.append(("Custom model ID", "custom"))
-    return options
+    """菜单项：严格按官方静态清单（用户提供的模型列表）。
+
+    不再用实时 /models 列表覆盖菜单 —— 官方清单里的逻辑别名（如 glm-5.3、
+    kimi-k2.7-code、minimax-m3）不在 /models 部署列表里，但可在 chat 端点
+    直接使用。菜单永远展示可读的官方清单，避免出现几百个带日期后缀的原始
+    部署 id（doubao-seed-2-0-lite-260428 等）。实时可用性验证走独立脚本
+    scripts/verify_provider_models.py，不影响菜单展示。
+    """
+    return list(get_model_options(provider, mode))
 
 
 def _pick_single(mode: str, provider: str) -> str | None:
@@ -67,12 +64,6 @@ def _pick_single(mode: str, provider: str) -> str | None:
     ).ask()
     if choice is None:
         return None  # Ctrl-C / Esc
-    if choice == "custom":
-        custom = questionary.text(
-            "Enter custom model ID:",
-            validate=lambda x: len(x.strip()) > 0 or "Please enter a model ID.",
-        ).ask()
-        return custom.strip() if custom else None
     return choice
 
 

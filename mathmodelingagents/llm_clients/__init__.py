@@ -42,8 +42,18 @@ _BACKOFF_BASE = 2.0  # 2s → 4s → 8s
 _MIN_CONTENT_CHARS = 10  # 低于此长度的输出视为模型故障
 
 
+class EmptyLLMResponseError(ValueError):
+    """LLM 返回空/极短内容（HTTP 200 但正文无有效输出），视为可重试的瞬态模型故障。"""
+
+    def __init__(self, char_count: int):
+        self.char_count = char_count
+        super().__init__(f"模型返回空/极短内容 ({char_count} 字符)，视为模型故障")
+
+
 def is_retryable_error(error: Exception) -> bool:
     """判断异常是否可重试（瞬态故障）。"""
+    if isinstance(error, EmptyLLMResponseError):
+        return True
     msg = str(error).lower()
     for code in _RETRYABLE_CODES:
         code_str = str(code)
@@ -74,16 +84,22 @@ def _invoke_with_retry(
             response = llm.invoke(messages)
             result = response.content
             if not result or len(result.strip()) < _MIN_CONTENT_CHARS:
-                raise ValueError(
-                    f"模型返回空/极短内容 ({len(result)} 字符)，视为模型故障"
-                )
+                raise EmptyLLMResponseError(len(result))
             if attempt > 1:
                 print(f"  [{layer}] {agent_name} ✅ retry succeeded on attempt {attempt}", flush=True)
                 logger.info(f"[{layer}] {agent_name} 第 {attempt} 次尝试成功")
             return result
         except Exception as e:
             last_error = e
-            if attempt < _MAX_RETRIES and is_retryable_error(e):
+            if isinstance(e, EmptyLLMResponseError):
+                if attempt < _MAX_RETRIES:
+                    delay = _BACKOFF_BASE ** attempt
+                    print(f"  [{layer}] {agent_name} ⚠️ 空响应 ({e.char_count} 字符) retry {attempt}/{_MAX_RETRIES} ({delay:.0f}s backoff)", flush=True)
+                    logger.warning(f"[{layer}] {agent_name} 空响应，第 {attempt}/{_MAX_RETRIES} 次重试，{delay:.0f}s 后重试: {e}")
+                    _time.sleep(delay)
+                else:
+                    break
+            elif attempt < _MAX_RETRIES and is_retryable_error(e):
                 delay = _BACKOFF_BASE ** attempt
                 err_code = ""
                 msg = str(e).lower()

@@ -5,7 +5,6 @@
 .env 文件读取后由 MATHMODELING_ 前缀的环境变量覆盖。
 """
 
-import json
 import logging
 import os
 from dotenv import load_dotenv
@@ -50,25 +49,6 @@ def _env(key: str, default: str | None = None) -> str | None:
     return os.getenv(f"MATHMODELING_{key.upper()}", default)
 
 
-def _parse_layer_overrides(env_val: str | None) -> dict:
-    """解析 MATHMODELING_LAYER_MODEL_OVERRIDES JSON 字符串。
-
-    用于覆盖各层各角色的模型分配，与代码中的 layer_model_overrides
-    做 deep merge（env 中的条目追加/覆盖代码默认值）。
-
-    示例:
-        MATHMODELING_LAYER_MODEL_OVERRIDES={"paper":{"writer":"qwen3.7-max","manager":"deepseek-v4-pro"},"modeling":{"agent":"deepseek-v4-pro"}}
-    """
-    if not env_val:
-        return {}
-    try:
-        return json.loads(env_val)
-    except json.JSONDecodeError as e:
-        import logging
-        logging.getLogger(__name__).warning(f"无法解析 MATHMODELING_LAYER_MODEL_OVERRIDES: {e}")
-        return {}
-
-
 # ── 默认的层模型分配 ──
 _DEFAULT_LAYER_MODEL_OVERRIDES: dict = {
     # ── Layer 1: 问题分析 ──
@@ -102,14 +82,8 @@ _DEFAULT_LAYER_MODEL_OVERRIDES: dict = {
     },
 }
 
-# 构建最终 layer_model_overrides（env JSON 覆盖代码默认）
-_base_overrides = _DEFAULT_LAYER_MODEL_OVERRIDES.copy()
-_env_overrides = _parse_layer_overrides(_env("layer_model_overrides"))
-for _layer_name, _layer_roles in _env_overrides.items():
-    if _layer_name not in _base_overrides:
-        _base_overrides[_layer_name] = {}
-    _base_overrides[_layer_name].update(_layer_roles)
-LAYER_MODEL_OVERRIDES: dict = _base_overrides
+# 层模型分配：精细覆盖现由 CLI 交互选择 / provider_layer_model_overrides 控制。
+LAYER_MODEL_OVERRIDES: dict = _DEFAULT_LAYER_MODEL_OVERRIDES
 
 
 DEFAULT_CONFIG: dict = {

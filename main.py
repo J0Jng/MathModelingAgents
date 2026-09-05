@@ -1,7 +1,7 @@
-"""[bold cyan]MathModelingAgents[/] — 多智能体数学建模竞赛框架
+"""MathModelingAgents — 多智能体数学建模竞赛框架
 
 Usage:
-    python main.py <题目文件路径> [--output <输出名>] [--sensitivity [auto|always|never]]
+    python main.py <题目文件路径> [--output <输出名>] [--sensitivity [auto|always|never]] [--max-rounds N] [--provider P] [--from-layer1 DIR]
 """
 
 import sys
@@ -13,6 +13,8 @@ from pathlib import Path
 
 from mathmodelingagents.default_config import DEFAULT_CONFIG
 from mathmodelingagents.graph.modeling_graph import MathModelingGraph
+from mathmodelingagents.llm_clients import get_layer_model
+from mathmodelingagents.tools import build_preamble
 
 
 def _verify_layer3_code(output_dir: str) -> str:
@@ -53,31 +55,43 @@ def _verify_layer3_code(output_dir: str) -> str:
         failed = 0
         for f in python_files:
             try:
+                # 以与沙盒一致的执行环境复现：拼上 build_preamble()，
+                # 使 agent 依赖沙盒内部名字（如 _original_import）或
+                # 自行配置 matplotlib 后端/中文字体的脚本在验证阶段也能通过，
+                # 避免“沙盒里能跑、验证裸进程挂掉”的假阴性。
+                # preamble 是独立子进程，_exec 模块命名空间注入后用户源码可见。
+                script_src = f.read_text(encoding='utf-8')
+                if 'matplotlib' in script_src:
+                    # 显式置 Agg 后端，避免 GUI 后端在无显示环境（验证子进程）触发
+                    script_src = "import matplotlib as _mpl\n_mpl.use('Agg', force=True)\n" + script_src
+                # 不拼 name/main 判断：preamble + 源码整体作为脚本顶层执行，
+                # 若源码自带 if __name__=='__main__' guard，顶层执行时恒为真分支。
+                sandboxed_src = build_preamble() + '\n' + script_src
                 result = subprocess.run(
-                    [sys.executable, str(f)],
-                    capture_output=True, text=True, timeout=120,
+                    [sys.executable, '-c', sandboxed_src],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120,
                     cwd=str(code_dir),
                 )
                 if result.returncode == 0:
                     passed += 1
                     stdout_preview = result.stdout.strip()[:300]
-                    line = f"- {f.name}: ✅ 通过"
+                    line = f'- {f.name}: \u2705 \u901a\u8fc7'
                     if stdout_preview:
-                        line += f"\n  stdout: {stdout_preview}"
+                        line += f'\n  stdout: {stdout_preview}'
                     report_lines.append(line)
                 else:
                     failed += 1
                     stderr_preview = result.stderr.strip()[:300]
                     report_lines.append(
-                        f"- {f.name}: ❌ 失败 (exit={result.returncode})\n"
-                        f"  stderr: {stderr_preview}"
+                        f'- {f.name}: \u274c \u5931\u8d25 (exit={result.returncode})\n'
+                        f'  stderr: {stderr_preview}'
                     )
             except subprocess.TimeoutExpired:
                 failed += 1
-                report_lines.append(f"- {f.name}: ❌ 超时 (120s)")
+                report_lines.append(f'- {f.name}: \u274c \u8d85\u65f6 (120s)')
             except Exception as e:
                 failed += 1
-                report_lines.append(f"- {f.name}: ❌ 执行异常: {e}")
+                report_lines.append(f'- {f.name}: \u274c \u6267\u884c\u5f02\u5e38: {e}')
 
         total = passed + failed
         if failed == 0:
@@ -104,15 +118,19 @@ def _verify_layer3_code(output_dir: str) -> str:
         combined_code = "\n\n".join(code_blocks)
 
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", delete=False, encoding="utf-8"
-        ) as f_tmp:
-            f_tmp.write(combined_code)
-            tmp_path = f_tmp.name
+                    mode="w", suffix=".py", delete=False, encoding="utf-8"
+                ) as f_tmp:
+                    # 与路径 A/沙盒一致：拼上 build_preamble()，避免 agent 依赖沙盒内部名字
+                    # （如 _original_import）时在裸进程验证阶段假阴性。哑变量置 Agg，防无显示环境触发 GUI。
+                    if "matplotlib" in combined_code:
+                        combined_code = "import matplotlib as _mpl\n_mpl.use('Agg', force=True)\n" + combined_code
+                    f_tmp.write(build_preamble() + "\n" + combined_code)
+                    tmp_path = f_tmp.name
 
         try:
             result = subprocess.run(
                 [sys.executable, tmp_path],
-                capture_output=True, text=True, timeout=120,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
                 cwd=str(output_path.parent),
             )
             if result.returncode == 0:
@@ -149,7 +167,6 @@ def build_config_from_args(args) -> dict:
     config["max_revision_rounds"] = args.max_rounds
     if args.sensitivity:
         config["sensitivity_mode"] = args.sensitivity
-    config["selected_layers"] = list(range(args.start_layer, 5))
 
     # ── CLI 交互式模型（agent）选择 ──
     try:
@@ -203,25 +220,14 @@ def main():
         help="LLM provider (opencode/deepseek/volcengine/volcengine-plan)",
     )
     parser.add_argument(
-        "--start-layer",
-        type=int,
-        default=1,
-        choices=[1, 2, 3, 4, 5],
-        help="从指定层开始执行，跳过前面的层（默认: 1）",
-    )
-    parser.add_argument(
         "--from-layer1",
         type=str,
         default=None,
         metavar="DIR",
-        help="从已完成的 Layer 1 输出目录恢复，只跑 L2→L3(+L5) 并生成模型解释文档（与 --start-layer 互斥）",
+        help="从已完成的 Layer 1 输出目录恢复，只跑 L2→L3(+L5) 并生成模型解释文档",
     )
 
     args = parser.parse_args()
-
-    # 互斥校验：--from-layer1 与 --start-layer 不能同时显式指定
-    if args.from_layer1 and args.start_layer != 1:
-        parser.error("--from-layer1 与 --start-layer 互斥，不能同时指定")
 
     # 验证输入文件
     problem_path = Path(args.problem_path)
@@ -249,22 +255,52 @@ def main():
             recovered["sensitivity_enabled"] = enabled
             recovered["sensitivity_reason"] = reason
         output_name = args.output or f"{problem_path.stem}_explain"
+        # 从已有 Layer 1 恢复：让流式层横幅从 L2 开始，不再打印「L1·问题分析 开始」
+        recovered["current_layer"] = str(config["selected_layers"][0])
 
     from mathmodelingagents.default_config import resolve_sensitivity_mode
     sensitivity_mode = resolve_sensitivity_mode(config)
 
+    # 模式行长标签：--from-layer1 时明确说明只跑 L2→L3(+L5)→解释
+    if config.get("explain_mode"):
+        mode_label = "恢复 (L1 已有 → L2·L3 → 解释)"
+    else:
+        mode_label = "完整流程 (L1→L4)"
+
+    # Banner 逐层展示实际解析出的模型（get_layer_model 与运行期完全一致，
+    # 含 layer_model_overrides / provider 级覆盖 / 别名映射）。
+    # 角色名以各层节点的实际调用为准：L1/L2 agent+manager，L3 coder+manager，L4 writer+manager。
+    # 实际执行哪些层由 config.selected_layers 控制，这里保守全部列出。
+    _layer_roles = [
+        ("L1 problem", "problem", ("agent", "manager")),
+        ("L2 modeling", "modeling", ("agent", "manager")),
+        ("L3 implementation", "implementation", ("coder", "manager")),
+        ("L4 paper", "paper", ("writer", "manager")),
+    ]
+    _banner_lines = [
+        "       MathModelingAgents v0.1.0",
+        f"  Provider:  {config['llm_provider']}",
+    ]
+    for _label, _layer, _roles in _layer_roles:
+        _models = " / ".join(
+            f"{_role}={get_layer_model(config, _layer, _role)}" for _role in _roles
+        )
+        _banner_lines.append(f"  {_label}  {_models}")
+    _banner_lines += [
+        f"  Problem:   {problem_path.name}",
+        f"  Output:    {output_name}",
+        f"  Mode:      {mode_label}",
+        f"  Sensitivity: {sensitivity_mode}",
+        f"  Max Rounds: {config['max_debate_rounds']}",
+    ]
+    _width = max(len(_line) for _line in _banner_lines)
+    _body = "".join(f"║{_line:<{_width}}║\n" for _line in _banner_lines)
+    _sep = f"╠{'═' * _width}╣\n"
+    _title, _rest = _body.split("\n", 1)
     print(f"""
-╔══════════════════════════════════════════════╗
-║       MathModelingAgents v0.1.0               ║
-╠══════════════════════════════════════════════╣
-║  Provider:  {config['llm_provider']:<34}║
-║  Quick:     {config.get('quick_think_llm', '-'):<34}║
-║  Deep:      {config.get('deep_think_llm', '-'):<34}║
-║  Problem:   {problem_path.name:<34}║
-║  Output:    {output_name:<34}║
-║  Sensitivity: {sensitivity_mode:<33}║
-║  Max Rounds: {config['max_debate_rounds']:<33}║
-╚══════════════════════════════════════════════╝
+╔{'═' * _width}╗
+{_title}
+{_sep}{_rest}╚{'═' * _width}╝
 """)
 
     # 初始化并运行
@@ -277,13 +313,13 @@ def main():
             output_name=output_name,
             initial_state_overrides=recovered,
         )
-        print(f"\\n✅ 完成！模型解释文档已输出到: {config.get('output_dir')}")
+        print(f"\n✅ 完成！模型解释文档已输出到: {config.get('output_dir')}")
     else:
         mm.propagate(
             problem_path=str(problem_path),
             output_name=output_name,
         )
-        print(f"\\n✅ 完成！论文已输出到: {config.get('output_dir')}")
+        print(f"\n✅ 完成！论文已输出到: {config.get('output_dir')}")
 
     # 代码验证：实际执行 Layer 3 代码块
     output_dir = config.get("output_dir", "")
