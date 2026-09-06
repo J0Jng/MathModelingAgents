@@ -49,8 +49,7 @@ def make_state() -> dict:
 class FakeStructuredLLM:
     """替身 LLM：with_structured_output 返回预置的决策结果。
 
-    ADR-0003 起 problem CONCLUDE 后有两次结构化调用（敏感性决策 + 候选模型池
-    提炼），fake 按 schema 类型返回对应形状，`calls` 计数为总调用次数。
+    problem CONCLUDE 后有 1 次结构化调用（敏感性决策），`calls` 计数为总调用次数。
     """
 
     def __init__(self, outcome=None, error: Exception | None = None):
@@ -66,11 +65,6 @@ class FakeStructuredLLM:
                 outer.calls += 1
                 if outer._error:
                     raise outer._error
-                if schema.__name__ == "ProblemTraits":
-                    return SimpleNamespace(
-                        problem_traits=["小样本", "时序预测"],
-                        description="数据量少的时间序列预测问题",
-                    )
                 return SimpleNamespace(
                     enabled=outer._outcome["enabled"],
                     reason=outer._outcome["reason"],
@@ -95,8 +89,8 @@ class TestSensitivityDecisionOnConclude:
         updates = run_node(monkeypatch, CONCLUDE_VERDICT, fake)
         assert updates["sensitivity_enabled"] is True
         assert updates["sensitivity_reason"] == "含关键权重参数，需扰动检验"
-        # 2 次结构化调用：敏感性决策 + 候选模型池提炼（ADR-0003）
-        assert fake.calls == 2
+        # 1 次结构化调用：敏感性决策
+        assert fake.calls == 1
 
     def test_decision_false_written_to_state(self, monkeypatch):
         fake = FakeStructuredLLM(outcome={"enabled": False, "reason": "纯描述统计，无参数可扰动"})
@@ -130,8 +124,8 @@ class TestDecisionOnlyInAutoMode:
         monkeypatch.setattr(agents_module, "invoke_with_fallback", lambda *a, **kw: CONCLUDE_VERDICT)
         monkeypatch.setattr(agents_module, "create_layer_llm", lambda *a, **kw: fake)
         updates = create_problem_manager(config)(make_state())
-        # 敏感性决策被模式接管（不调用），但候选模型池提炼（ADR-0003）仍执行 1 次
-        assert fake.calls == 1
+        # 敏感性决策被模式接管（不调用），无任何结构化调用
+        assert fake.calls == 0
         assert "sensitivity_enabled" not in updates
 
 
@@ -188,8 +182,8 @@ class TestEndToEndWithRealisticProblem:
         # 裁决通过
         assert updates["problem_report"] == self.REALISTIC_VERDICT
         assert "CONCLUDE" in updates["problem_report"]
-        # 决策调用执行了一次（另有 1 次候选模型池提炼，ADR-0003，共 2 次）
-        assert fake.calls == 2
+        # 决策调用执行了一次
+        assert fake.calls == 1
         # 决策写入状态
         assert updates["sensitivity_enabled"] is True
         assert "学习率" in updates["sensitivity_reason"]

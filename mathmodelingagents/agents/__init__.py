@@ -7,7 +7,7 @@
 
 import logging
 import re
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -113,87 +113,6 @@ def _persist_sensitivity_decision(config: dict, enabled: bool, reason: str) -> N
         logger.info(f"[problem] 敏感性决策已落盘: {path}")
     except OSError as e:
         logger.warning(f"[problem] 敏感性决策落盘失败（不影响主流程）: {e}")
-
-
-class CandidatePoolResult(NamedTuple):
-    """候选模型池检索结果（ADR-0003）。
-
-    source 三种语义：
-    - "rag":           真实向量检索命中（search_models 正常返回 Top-5）
-    - "full_library":  fail-open 降级为全量谱系（提炼/检索/向量化任一步异常，
-                       但 load_model_library() 成功）
-    - "empty":         完全失败（连全量谱系都加载失败）
-    """
-    source: str   # "rag" | "full_library" | "empty"
-    text: str     # markdown 候选池文本（写入 state["model_candidates"]）
-    query: str    # 检索 query 文本（CLI 显示依据）
-
-
-def _run_model_candidate_search(config: dict, problem_report: str) -> CandidatePoolResult:
-    """Layer 1 候选模型池提炼（ADR-0003）：ProblemManager CONCLUDE 后结构化调用。
-
-    用 problem 层 manager 档模型 + with_structured_output 提炼「题目特点需求」
-    （3-8 个纯中文特点标签 + 一两句描述），编码为 query 向量检索模型知识库
-    Top-5，格式化为 markdown 候选池文本供 Layer 2 第一轮注入。
-
-    fail-open：提炼/检索/向量化任一步失败 → 降级返回全量谱系（不阻塞主流程）。
-
-    Args:
-        config: 全局配置。
-        problem_report: ProblemManager 的最终裁决文本（含完整问题分析）。
-
-    Returns:
-        CandidatePoolResult(source, text, query)：
-        - source="rag"：真实检索命中，text 为 Top-5 markdown 候选池，query 为检索文本；
-        - source="full_library"：降级为全量谱系，text 为 52 条 markdown，query 为空；
-        - source="empty"：连全量谱系都加载失败，text 和 query 均为空。
-    """
-    from pydantic import BaseModel, Field
-
-    from mathmodelingagents.knowledge import (
-        build_query,
-        format_model_entries,
-        load_model_library,
-        search_models,
-    )
-
-    class ProblemTraits(BaseModel):
-        """题目特点需求结构化 schema。"""
-        problem_traits: list[str] = Field(
-            description="3-8 个纯中文题目特点标签，如：小样本、指数增长、多目标优化、离散决策",
-        )
-        description: str = Field(
-            description="一两句纯中文的题目特点描述：数据形态、求解目标、关键难点",
-        )
-
-    try:
-        llm = create_layer_llm(config, "problem", "manager")
-        structured = llm.with_structured_output(ProblemTraits)
-        parsed = structured.invoke([
-            SystemMessage(content=(
-                "你是数学建模竞赛的方法选型专家。根据题目分析报告，提炼本题的"
-                "「题目特点需求」：3-8 个纯中文特点标签（数据形态/目标类型/约束特征，"
-                "如：小样本、非线性、多目标、时序预测），加一两句特点描述。"
-                "标签用于检索候选数学模型知识库，请贴题目实际特征，不要罗列模型名。"
-            )),
-            HumanMessage(content=f"## 题目分析报告\n\n{problem_report}\n\n请提炼题目特点。"),
-        ])
-        traits = [t.strip() for t in (parsed.problem_traits or []) if t and t.strip()]
-        description = str(getattr(parsed, "description", "") or "").strip()
-        query = build_query(traits, description)
-        results = search_models(query, top_k=5)
-        logger.info(
-            "[problem] 候选模型池检索完成: traits=%s, top1=%s",
-            traits[:8], results[0].get("name", "") if results else "",
-        )
-        return CandidatePoolResult("rag", format_model_entries(results), query)
-    except Exception as e:
-        logger.warning(f"[problem] 候选模型池检索失败，fail-open 返回全量谱系: {e}")
-        try:
-            return CandidatePoolResult("full_library", format_model_entries(load_model_library()), "")
-        except Exception as e2:
-            logger.warning(f"[problem] 全量谱系加载失败，跳过候选池注入: {e2}")
-            return CandidatePoolResult("empty", "", "")
 
 
 def _extract_final_output(messages: list) -> str:
@@ -682,12 +601,7 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
             parts.append(f"## Layer 1 综合问题分析（建模基准——阅读后开始设计模型）\n\n{state['problem_report']}")
         if state.get("background_research"):
             parts.append(f"## 题目背景资料（Layer 1 自动搜索）\n\n{state['background_research']}")
-        # ── 候选模型池（ADR-0003）：仅第一轮注入，后续轮次不重复 ──
-        # modeler 节点不递增 round_count（由 Manager 管理），首轮 debate.round_count 为 0
-        candidates = state.get("model_candidates", "")
         debate = state.get("model_debate_state", {})
-        if candidates and debate.get("round_count", 0) <= 1:
-            parts.append(f"## 候选模型池（参考起点，可超越）\n\n{candidates}")
         if debate.get("a_history"):
             parts.append(f"## 建模师 A 历史发言\n\n{debate['a_history']}")
         if debate.get("b_history"):
@@ -931,20 +845,6 @@ def _make_manager_node(
                 _persist_sensitivity_decision(config, enabled, reason)
                 print(f"[problem] 敏感性决策: {'✅ 启用' if enabled else '⏭️ 跳过'} - {reason}", flush=True)
 
-            # ── Layer 1 候选模型池（ADR-0003）：CONCLUDE 后结构化提炼 + RAG 检索 ──
-            # 不依赖敏感性模式；任何失败 fail-open 降级，不阻塞主流程
-            if layer == "problem":
-                pool = _run_model_candidate_search(config, result)
-                if pool.source == "rag" and pool.text:
-                    updates["model_candidates"] = pool.text
-                    print(f"[problem] 🎯 RAG 候选模型池命中（Top-5）— query: {pool.query}", flush=True)
-                    print(pool.text, flush=True)
-                elif pool.source == "full_library" and pool.text:
-                    updates["model_candidates"] = pool.text
-                    print("[problem] ⚠️ RAG 检索失败，候选池降级为全量谱系（52 条）", flush=True)
-                else:
-                    print("[problem] ⚠️ 候选模型池生成失败，跳过注入", flush=True)
-
         # 根据层写入特定字段
         if layer == "problem":
             updates["problem_report"] = result
@@ -1148,9 +1048,9 @@ def _make_modeler_node(
     response_key: str,
     history_key: str,
 ) -> Callable[[AgentState], dict[str, Any]]:
-    """创建建模师节点（辩论参与者，tool-calling 版，ADR-0003）。
+    """创建建模师节点（辩论参与者，tool-calling 版）。
 
-    绑定 model_search（模型知识库 RAG）+ web_search + run_code 三个工具，
+    绑定 web_search + run_code 两个工具，
     使用 modeler 专用循环 _run_modeler_turn：一次发言以纯文本方案为终止条件，
     调用工具只是辅助验证，max_iterations=10 仅作连续 tool_calls 的保底上限。
     输出提取沿用 _extract_final_output；辩论状态更新逻辑与原实现一致。
@@ -1173,8 +1073,8 @@ def _make_modeler_node(
             HumanMessage(content=user_msg),
         ]
 
-        # ── 绑定工具：model_search + web_search + run_code（临时目录版）──
-        wanted = {"model_search_tool", "web_search_tool", "run_code_tool"}
+        # ── 绑定工具：web_search + run_code（临时目录版）──
+        wanted = {"web_search_tool", "run_code_tool"}
         tools = [t for t in create_langchain_tools() if t.name in wanted]
 
         def _invoke_fn(msgs):

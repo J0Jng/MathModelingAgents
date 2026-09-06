@@ -28,10 +28,6 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "typing-extensions>=4.14.0",
 
-    # ── 模型知识库 RAG（ADR-0003）：本地 embedding，不引入 torch ──
-    "fastembed>=0.8.0",
-    "onnxruntime>=1.17",
-
     # ── CLI interactive menu ──
     "questionary>=2.0.0",
     "rich>=13.0.0",

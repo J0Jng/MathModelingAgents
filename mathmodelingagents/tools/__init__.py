@@ -370,20 +370,6 @@ def create_langchain_tools() -> list:
         return web_search(query)
 
     @tool
-    def model_search_tool(query: str) -> str:
-        """按题目特点在模型知识库中做向量语义检索，返回最相关的候选数学模型（Top-5）。
-
-        query 用纯中文特点标签或短语，如 "小样本 指数增长 预测"。
-        检索失败时自动降级返回全量模型谱系（fail-open）。
-        """
-        from mathmodelingagents.knowledge import format_model_entries, search_models
-        try:
-            return format_model_entries(search_models(query, top_k=5))
-        except Exception as e:
-            logger.warning("model_search_tool 检索失败: %s", e)
-            return f"[检索失败] {e}"
-
-    @tool
     def write_file_tool(
         content: str,
         path: str,
@@ -407,7 +393,6 @@ def create_langchain_tools() -> list:
         read_file_tool,
         run_code_tool,
         web_search_tool,
-        model_search_tool,
         write_file_tool,
     ]
 
