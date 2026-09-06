@@ -3,7 +3,13 @@
 纯字符串断言，不 spawn 子进程/网络。阻塞策略作为数据注入：
 - blocked 缺省为 _RISKY_MODULES，可用参数覆盖
 - allowed 参数落地（注入 _safe_allow），缺省为空（不限制，保持 blocklist-only 现状）
+
+Safe-submodule 豁免（urllib.parse）部分为子进程级端到端测试：
+真实 spawn 子进程验证 _safe_import 行为，不用 mock。
 """
+
+import subprocess
+import sys
 
 import mathmodelingagents.tools as tools
 from mathmodelingagents.tools import build_preamble
@@ -18,9 +24,11 @@ class TestBuildPreamble:
         p = build_preamble(blocked_modules={"socket", "os"})
         assert "socket" in p
         assert "os" in p
-        # 默认 risky 里、但不在自定义集合中的额外模块不应出现在 _blocked 串中
+        # 默认 risky 里、但不在自定义集合中的额外模块不应出现在 _blocked 注入行中
+        # （只检查 _blocked 行而非全文：_safe_submods 行合法包含 "urllib.parse"）
+        blocked_line = next(line for line in p.splitlines() if line.startswith("_blocked"))
         for m in ("requests", "urllib", "http", "ctypes"):
-            assert m not in p
+            assert m not in blocked_line
 
     def test_allowed_param_lands(self):
         # allowed_modules 真正注入 preamble（注入 _safe_allow，而非摆设）
@@ -38,3 +46,33 @@ class TestBuildPreamble:
         # 中文字体 preamble 原样保留（另一关注点，本 ticket 不动）
         p = build_preamble()
         assert "matplotlib Chinese font auto-config" in p
+
+
+class TestSafeSubmodulesE2E:
+    """子进程级端到端：真实 spawn 验证 urllib.parse 豁免与网络边界不放松。"""
+
+    def _run(self, payload: str) -> subprocess.CompletedProcess:
+        full = build_preamble() + "\n" + payload
+        return subprocess.run(
+            [sys.executable, "-c", full],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+
+    def test_urllib_parse_allowed(self):
+        r = self._run("import urllib.parse\nprint('OK', urllib.parse.urlparse('http://x/y').netloc)\n")
+        assert r.returncode == 0, r.stderr
+        assert "OK x" in r.stdout
+        assert "字体配置异常" not in r.stdout  # 字体配置不再被 urllib.parse 打断
+
+    def test_urllib_request_still_blocked(self):
+        r = self._run("import urllib.request\n")
+        assert r.returncode != 0
+        assert "blocked for security reasons" in r.stderr
+
+    def test_socket_still_blocked(self):
+        r = self._run("import socket\n")
+        assert r.returncode != 0
+
+    def test_safe_submods_injected(self):
+        assert "_safe_submods" in build_preamble()
+        assert "urllib.parse" in build_preamble()

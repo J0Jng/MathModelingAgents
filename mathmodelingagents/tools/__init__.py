@@ -75,10 +75,19 @@ _RISKY_MODULES = {
     "ctypes",
 }
 
+# Safe submodules that live under a blocked root yet provide no network/unsafe
+# capability. urllib.parse is pure URL/string parsing (no sockets) and is
+# imported internally by matplotlib.font_manager — blocking it spuriously
+# breaks the CJK font auto-config. The root "urllib" stays blocked.
+_SAFE_SUBMODULES = {
+    "urllib.parse",
+}
+
 
 def build_preamble(
     blocked_modules: list[str] | set[str] | None = None,
     allowed_modules: list[str] | None = None,
+    safe_submodules: list[str] | set[str] | None = None,
 ) -> str:
     """Return the sandbox import-blocking preamble as a string.
 
@@ -92,6 +101,10 @@ def build_preamble(
             is rejected on import (restrictive). Defaults to empty — meaning
             *no* extra restriction, preserving the historical blocklist-only
             sandbox.
+        safe_submodules: Precise full module names exempted from the root
+            blocklist (e.g. ``urllib.parse`` — pure parsing, no network).
+            Defaults to ``_SAFE_SUBMODULES``. Only exact full-name matches are
+            allowed; sibling submodules under a blocked root stay blocked.
 
     Why the allowlist is opt-in by default: enforcing one by default (e.g.
     ``DEFAULT_ALLOWED_MODULES``) would reject the stdlib/PIL/kiwisolver etc.
@@ -101,6 +114,7 @@ def build_preamble(
     """
     block_set = set(_RISKY_MODULES if blocked_modules is None else blocked_modules)
     allow_set = set(allowed_modules or [])
+    safe_submod_set = set(_SAFE_SUBMODULES if safe_submodules is None else safe_submodules)
 
     preamble_lines = [
         "import sys",
@@ -108,10 +122,15 @@ def build_preamble(
         "# --- code sandbox preamble ---",
         f"_blocked = {sorted(block_set)!r}",
         f"_safe_allow = {sorted(allow_set)!r}",
+        f"_safe_submods = {sorted(safe_submod_set)!r}",
         "# Snapshot of modules that were loaded before user code runs",
         "_preloaded = set(sys.modules.keys())",
         "_original_import = __import__",
         "def _safe_import(name, *args, **kwargs):",
+        "    # Precise safe-submodule allow: urllib.parse is pure parsing (no network),",
+        "    # and is imported internally by matplotlib.font_manager (CJK font config).",
+        "    if name in _safe_submods:",
+        "        return _original_import(name, *args, **kwargs)",
         "    _root = name.split('.')[0]",
         "    # ALWAYS block risky modules — even if preloaded by the runtime",
         "    if _root in _blocked:",
