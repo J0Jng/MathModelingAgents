@@ -8,8 +8,8 @@
   - "volcengine"          火山方舟 **Coding Plan**（`api/coding/v3`，`VOLCENGINE_API_KEY`）
   - "volcengine-plan"     火山方舟 **Agent Plan**（`api/plan/v3`，`VOLCENGINE_PLAN_API_KEY`）
 
-Timeout 策略（从 config.layer_timeouts 读取，统一 10800s = 3h）：
-  - 不限时间，确保推理模型能完整跑完
+Timeout 策略（从 config.layer_timeouts 读取，默认 180s）：
+  - 默认 180s，超时抛 OpenAITimeoutError 后走重试/降级链
 """
 
 import logging
@@ -19,8 +19,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# 默认超时（秒）— 当 config 中未指定时使用，统一 3 小时
-DEFAULT_TIMEOUT = 10800
+# 默认超时（秒）— 当 config 中未指定时使用
+DEFAULT_TIMEOUT = 180
 
 # ═══════════════════════════════════════════════
 # LLM 调用重试（从 agents/__init__.py 迁移）
@@ -33,6 +33,7 @@ _RETRYABLE_SUBSTRINGS = (
     "rate limit",
     "connection",
     "timeout",
+    "timed out",
     "failover_exhausted",
     "temporarily unavailable",
     "server error",
@@ -52,6 +53,9 @@ class EmptyLLMResponseError(ValueError):
 
 def is_retryable_error(error: Exception) -> bool:
     """判断异常是否可重试（瞬态故障）。"""
+    from openai import APITimeoutError, APIConnectionError
+    if isinstance(error, (APITimeoutError, APIConnectionError)):
+        return True
     if isinstance(error, EmptyLLMResponseError):
         return True
     msg = str(error).lower()
@@ -290,6 +294,21 @@ def create_layer_llm(
     )
 
 
+def _build_fallback_steps(config: dict, layer: str, role: str) -> list[tuple[str, str, str | None]]:
+    """构造 4 步降级链，供 invoke_with_fallback / invoke_with_tools_with_fallback 共用。"""
+    provider = config.get("llm_provider", "opencode")
+    fallback_provider = config.get("fallback_provider", "deepseek")
+    primary_model = get_layer_model(config, layer, role)
+    flash_model = config.get("quick_think_llm", "deepseek-v4-flash")
+    fallback_base_url = config.get("fallback_base_url")
+    return [
+        (provider, primary_model, None),
+        (fallback_provider, primary_model, fallback_base_url),
+        (provider, flash_model, None),
+        (fallback_provider, flash_model, fallback_base_url),
+    ]
+
+
 def invoke_with_fallback(
     config: dict,
     layer: str,
@@ -323,26 +342,15 @@ def invoke_with_fallback(
     Raises:
         RuntimeError: 4 步全部失败。
     """
-    provider = config.get("llm_provider", "opencode")
-    fallback_provider = config.get("fallback_provider", "deepseek")
     timeout = config.get("layer_timeouts", {}).get(layer, DEFAULT_TIMEOUT)
 
-    primary_model = get_layer_model(config, layer, role)
     if max_tokens is None:
         max_tokens = resolve_max_tokens(config, role)
 
     temp_overrides = config.get("temperature_overrides", {})
     temperature = temp_overrides.get(role, config.get("default_temperature", 0.0))
 
-    fallback_base_url = config.get("fallback_base_url")
-    flash_model = config.get("quick_think_llm", "deepseek-v4-flash")
-
-    steps = [
-        (provider, primary_model, None),
-        (fallback_provider, primary_model, fallback_base_url),
-        (provider, flash_model, None),
-        (fallback_provider, flash_model, fallback_base_url),
-    ]
+    steps = _build_fallback_steps(config, layer, role)
 
     last_error = None
     for step_num, (prov, model, base_url) in enumerate(steps, 1):
@@ -357,6 +365,103 @@ def invoke_with_fallback(
                 result = f"[降级 {prov}/{model}]\n\n{result}"
             logger.info(f"[{layer}] {agent_name} step{step_num} ({prov}/{model}) 成功")
             return result
+        except Exception as e:
+            last_error = e
+            print(f"  [{layer}] {agent_name} ⚠️ {prov}/{model} unavailable → trying next fallback", flush=True)
+            logger.warning(f"[{layer}] {agent_name} step{step_num} ({prov}/{model}) 不可用: {e}")
+
+    raise RuntimeError(f"[{layer}] {agent_name} 降级链全部失败: {last_error}")
+
+
+def _invoke_tools_with_retry(
+    llm_with_tools,
+    messages: list,
+    agent_name: str,
+    layer: str,
+) -> Any:
+    """带重试的工具调用 invoke，返回 AIMessage（含 tool_calls）。
+
+    软失败判定：无 tool_calls 且 content.strip() < _MIN_CONTENT_CHARS（10）→ 视为
+    EmptyLLMResponseError，走指数退避重试（2s→4s→8s）。与 _run_tool_loop 现有软失败
+    检测对齐（agents/__init__.py），语义一致。
+    """
+    last_error = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            response = llm_with_tools.invoke(messages)
+            content = getattr(response, "content", "") or ""
+            if not getattr(response, "tool_calls", None) and len(content.strip()) < _MIN_CONTENT_CHARS:
+                raise EmptyLLMResponseError(len(content))
+            if attempt > 1:
+                logger.info(f"[{layer}] {agent_name} 第 {attempt} 次尝试成功（工具调用）")
+            return response
+        except Exception as e:
+            last_error = e
+            if isinstance(e, EmptyLLMResponseError):
+                if attempt < _MAX_RETRIES:
+                    delay = _BACKOFF_BASE ** attempt
+                    logger.warning(
+                        f"[{layer}] {agent_name} 空响应，第 {attempt}/{_MAX_RETRIES} 次重试，"
+                        f"{delay:.0f}s 后重试: {e}"
+                    )
+                    _time.sleep(delay)
+                else:
+                    break
+            elif attempt < _MAX_RETRIES and is_retryable_error(e):
+                delay = _BACKOFF_BASE ** attempt
+                logger.warning(
+                    f"[{layer}] {agent_name} 工具调用第 {attempt}/{_MAX_RETRIES} 次失败（可重试），"
+                    f"{delay:.0f}s 后重试: {e}"
+                )
+                _time.sleep(delay)
+            else:
+                break
+    raise last_error  # type: ignore[misc]
+
+
+def invoke_with_tools_with_fallback(
+    config: dict,
+    layer: str,
+    role: str,
+    tools: list,
+    messages: list,
+    agent_name: str,
+    *,
+    max_tokens: int | None = None,
+) -> Any:
+    """带多级 provider/model 降级的 tool-calling invoke。
+
+    降级链与 invoke_with_fallback 完全一致（主 provider+角色模型 → fallback provider
+    +同模型 → 主 provider+flash → fallback provider+flash），每步内 3 次指数退避重试。
+
+    Returns:
+        第一个成功的 AIMessage（含 tool_calls）。降级成功只写日志、不修改 response。
+    Raises:
+        RuntimeError: 4 步全部失败。
+    """
+    timeout = config.get("layer_timeouts", {}).get(layer, DEFAULT_TIMEOUT)
+    if max_tokens is None:
+        max_tokens = resolve_max_tokens(config, role)
+    temperature = config.get("temperature_overrides", {}).get(
+        role, config.get("default_temperature", 0.0)
+    )
+    steps = _build_fallback_steps(config, layer, role)
+
+    last_error = None
+    for step_num, (prov, model, base_url) in enumerate(steps, 1):
+        try:
+            llm = create_llm_client(
+                provider=prov, model=model, base_url=base_url,
+                temperature=temperature, max_tokens=max_tokens,
+                request_timeout=timeout,
+            )
+            llm_with_tools = llm.bind_tools(tools)
+            response = _invoke_tools_with_retry(llm_with_tools, messages, agent_name, layer)
+            if step_num > 1:
+                logger.info(f"[{layer}] {agent_name} 降级 {prov}/{model} 成功")
+            else:
+                logger.info(f"[{layer}] {agent_name} step1 ({prov}/{model}) 成功")
+            return response
         except Exception as e:
             last_error = e
             print(f"  [{layer}] {agent_name} ⚠️ {prov}/{model} unavailable → trying next fallback", flush=True)

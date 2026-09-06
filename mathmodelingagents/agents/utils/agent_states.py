@@ -50,6 +50,7 @@ class AgentState(TypedDict, total=False):
     problem_messages: list
     sensitivity_enabled: bool       # Layer 1 敏感性决策（ADR-0001）；缺省视为 True（fail-open）
     sensitivity_reason: str         # 敏感性决策理由（随上下文注入 Layer 2/3，为扰动预留参数面）
+    model_candidates: str           # Layer 1 候选模型池文本（ADR-0003，RAG 检索 Top-5；注入 Layer 2 第一轮）
 
     # ═══ Layer 2 产出 ═══
     model_debate_state: DebateState

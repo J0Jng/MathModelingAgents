@@ -7,13 +7,13 @@
 
 import logging
 import re
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from mathmodelingagents.agents.utils.agent_states import AgentState
 from mathmodelingagents.agents.utils.prompt_templates import get_prompt, get_global_constraints
-from mathmodelingagents.llm_clients import invoke_with_fallback, resolve_max_tokens, is_retryable_error, create_layer_llm
+from mathmodelingagents.llm_clients import invoke_with_fallback, resolve_max_tokens, is_retryable_error, create_layer_llm, EmptyLLMResponseError, invoke_with_tools_with_fallback
 from mathmodelingagents.default_config import resolve_sensitivity_mode
 from mathmodelingagents.tools.web_search import web_search
 
@@ -62,7 +62,7 @@ def _run_sensitivity_decision(config: dict, problem_report: str) -> tuple[bool, 
     try:
         # 温度不显式传：manager 角色由 temperature_overrides 解析为 0.1（低温），
         # 避免绕过配置链
-        llm = create_layer_llm(config, "problem", "manager", max_tokens=1024)
+        llm = create_layer_llm(config, "problem", "manager")
         structured = llm.with_structured_output(SensitivityDecision)
         decision = structured.invoke([
             SystemMessage(content=(
@@ -113,6 +113,87 @@ def _persist_sensitivity_decision(config: dict, enabled: bool, reason: str) -> N
         logger.info(f"[problem] 敏感性决策已落盘: {path}")
     except OSError as e:
         logger.warning(f"[problem] 敏感性决策落盘失败（不影响主流程）: {e}")
+
+
+class CandidatePoolResult(NamedTuple):
+    """候选模型池检索结果（ADR-0003）。
+
+    source 三种语义：
+    - "rag":           真实向量检索命中（search_models 正常返回 Top-5）
+    - "full_library":  fail-open 降级为全量谱系（提炼/检索/向量化任一步异常，
+                       但 load_model_library() 成功）
+    - "empty":         完全失败（连全量谱系都加载失败）
+    """
+    source: str   # "rag" | "full_library" | "empty"
+    text: str     # markdown 候选池文本（写入 state["model_candidates"]）
+    query: str    # 检索 query 文本（CLI 显示依据）
+
+
+def _run_model_candidate_search(config: dict, problem_report: str) -> CandidatePoolResult:
+    """Layer 1 候选模型池提炼（ADR-0003）：ProblemManager CONCLUDE 后结构化调用。
+
+    用 problem 层 manager 档模型 + with_structured_output 提炼「题目特点需求」
+    （3-8 个纯中文特点标签 + 一两句描述），编码为 query 向量检索模型知识库
+    Top-5，格式化为 markdown 候选池文本供 Layer 2 第一轮注入。
+
+    fail-open：提炼/检索/向量化任一步失败 → 降级返回全量谱系（不阻塞主流程）。
+
+    Args:
+        config: 全局配置。
+        problem_report: ProblemManager 的最终裁决文本（含完整问题分析）。
+
+    Returns:
+        CandidatePoolResult(source, text, query)：
+        - source="rag"：真实检索命中，text 为 Top-5 markdown 候选池，query 为检索文本；
+        - source="full_library"：降级为全量谱系，text 为 52 条 markdown，query 为空；
+        - source="empty"：连全量谱系都加载失败，text 和 query 均为空。
+    """
+    from pydantic import BaseModel, Field
+
+    from mathmodelingagents.knowledge import (
+        build_query,
+        format_model_entries,
+        load_model_library,
+        search_models,
+    )
+
+    class ProblemTraits(BaseModel):
+        """题目特点需求结构化 schema。"""
+        problem_traits: list[str] = Field(
+            description="3-8 个纯中文题目特点标签，如：小样本、指数增长、多目标优化、离散决策",
+        )
+        description: str = Field(
+            description="一两句纯中文的题目特点描述：数据形态、求解目标、关键难点",
+        )
+
+    try:
+        llm = create_layer_llm(config, "problem", "manager")
+        structured = llm.with_structured_output(ProblemTraits)
+        parsed = structured.invoke([
+            SystemMessage(content=(
+                "你是数学建模竞赛的方法选型专家。根据题目分析报告，提炼本题的"
+                "「题目特点需求」：3-8 个纯中文特点标签（数据形态/目标类型/约束特征，"
+                "如：小样本、非线性、多目标、时序预测），加一两句特点描述。"
+                "标签用于检索候选数学模型知识库，请贴题目实际特征，不要罗列模型名。"
+            )),
+            HumanMessage(content=f"## 题目分析报告\n\n{problem_report}\n\n请提炼题目特点。"),
+        ])
+        traits = [t.strip() for t in (parsed.problem_traits or []) if t and t.strip()]
+        description = str(getattr(parsed, "description", "") or "").strip()
+        query = build_query(traits, description)
+        results = search_models(query, top_k=5)
+        logger.info(
+            "[problem] 候选模型池检索完成: traits=%s, top1=%s",
+            traits[:8], results[0].get("name", "") if results else "",
+        )
+        return CandidatePoolResult("rag", format_model_entries(results), query)
+    except Exception as e:
+        logger.warning(f"[problem] 候选模型池检索失败，fail-open 返回全量谱系: {e}")
+        try:
+            return CandidatePoolResult("full_library", format_model_entries(load_model_library()), "")
+        except Exception as e2:
+            logger.warning(f"[problem] 全量谱系加载失败，跳过候选池注入: {e2}")
+            return CandidatePoolResult("empty", "", "")
 
 
 def _extract_final_output(messages: list) -> str:
@@ -240,8 +321,8 @@ def _sanitize_tool_pairing(messages: list) -> list:
 
 def _run_tool_loop(
     *,
-    llm: Any,
-    llm_with_tools: Any,
+    llm: Any = None,
+    llm_with_tools: Any = None,
     tools: list,
     layer_tag: str,
     agent_tag: str,
@@ -252,6 +333,7 @@ def _run_tool_loop(
     sanitize: Callable[[list], list] | None = None,
     on_summary_after_exhaust: Callable[[Any, list], str | None] | None = None,
     on_selfcheck: Callable[[str, list], str] | None = None,
+    invoke_fn: Callable[[list], Any] | None = None,
 ) -> tuple[list, str]:
     """运行 agentic tool-calling 循环，返回 (messages, final_output)。
 
@@ -280,22 +362,30 @@ def _run_tool_loop(
         if sanitize is not None:
             messages = sanitize(messages)
 
-        # ── Invoke LLM with retry ──
+        # ── Invoke LLM：invoke_fn 存在时走降级链回调；否则内联重试 ──
         response = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = llm_with_tools.invoke(messages)
-                break
-            except Exception as e:
-                if attempt < max_retries and is_retryable_error(e):
-                    delay = 2 ** attempt
-                    logger.warning(
-                        f"[{layer_tag}] {agent_tag} LLM 调用重试 {attempt}/{max_retries}, "
-                        f"{delay}s: {e}"
-                    )
-                    _time.sleep(delay)
-                else:
-                    raise
+        if invoke_fn is not None:
+            response = invoke_fn(messages)
+        else:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    response = llm_with_tools.invoke(messages)
+                    # 软失败检测：无 tool_calls 且正文空/过短（HTTP 200 但空包），
+                    # 与 _invoke_with_retry 的空响应判定对齐，视为瞬态故障走重试。
+                    _content = getattr(response, "content", "") or ""
+                    if not getattr(response, "tool_calls", None) and len(_content.strip()) < 10:
+                        raise EmptyLLMResponseError(len(_content))
+                    break
+                except Exception as e:
+                    if attempt < max_retries and is_retryable_error(e):
+                        delay = 2 ** attempt
+                        logger.warning(
+                            f"[{layer_tag}] {agent_tag} LLM 调用重试 {attempt}/{max_retries}, "
+                            f"{delay}s: {e}"
+                        )
+                        _time.sleep(delay)
+                    else:
+                        raise
 
         messages.append(response)
 
@@ -592,7 +682,12 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
             parts.append(f"## Layer 1 综合问题分析（建模基准——阅读后开始设计模型）\n\n{state['problem_report']}")
         if state.get("background_research"):
             parts.append(f"## 题目背景资料（Layer 1 自动搜索）\n\n{state['background_research']}")
+        # ── 候选模型池（ADR-0003）：仅第一轮注入，后续轮次不重复 ──
+        # modeler 节点不递增 round_count（由 Manager 管理），首轮 debate.round_count 为 0
+        candidates = state.get("model_candidates", "")
         debate = state.get("model_debate_state", {})
+        if candidates and debate.get("round_count", 0) <= 1:
+            parts.append(f"## 候选模型池（参考起点，可超越）\n\n{candidates}")
         if debate.get("a_history"):
             parts.append(f"## 建模师 A 历史发言\n\n{debate['a_history']}")
         if debate.get("b_history"):
@@ -836,6 +931,20 @@ def _make_manager_node(
                 _persist_sensitivity_decision(config, enabled, reason)
                 print(f"[problem] 敏感性决策: {'✅ 启用' if enabled else '⏭️ 跳过'} - {reason}", flush=True)
 
+            # ── Layer 1 候选模型池（ADR-0003）：CONCLUDE 后结构化提炼 + RAG 检索 ──
+            # 不依赖敏感性模式；任何失败 fail-open 降级，不阻塞主流程
+            if layer == "problem":
+                pool = _run_model_candidate_search(config, result)
+                if pool.source == "rag" and pool.text:
+                    updates["model_candidates"] = pool.text
+                    print(f"[problem] 🎯 RAG 候选模型池命中（Top-5）— query: {pool.query}", flush=True)
+                    print(pool.text, flush=True)
+                elif pool.source == "full_library" and pool.text:
+                    updates["model_candidates"] = pool.text
+                    print("[problem] ⚠️ RAG 检索失败，候选池降级为全量谱系（52 条）", flush=True)
+                else:
+                    print("[problem] ⚠️ 候选模型池生成失败，跳过注入", flush=True)
+
         # 根据层写入特定字段
         if layer == "problem":
             updates["problem_report"] = result
@@ -964,18 +1073,92 @@ def create_problem_manager(config: dict) -> Callable[[AgentState], dict[str, Any
 # Layer 2: Modeling (Debate)
 # ═══════════════════════════════════════════════════════════════════
 
+def _run_modeler_turn(
+    *,
+    tools: list,
+    layer_tag: str,
+    agent_tag: str,
+    max_iterations: int,
+    initial_messages: list,
+    invoke_fn: Callable[[list], Any],
+) -> tuple[list, str]:
+    """运行一轮建模师发言（辩论参与者专用，不复用 Solver 的 _run_tool_loop）。
+
+    语义与 Solver 相反：建模师一轮发言以文字方案为产物，调用工具只是辅助验证。
+    - 返回 tool_calls → 执行工具、喂回结果、继续（允许继续验证/检索）
+    - 返回纯文本（无 tool_calls）→ 本轮发言完成，立即以该文本为 result 返回
+    不再有「连续 N 轮无工具调用 → 强制中断」，也不再反向取最后一条文本。
+    """
+    import json as _json
+    from langchain_core.messages import ToolMessage
+
+    messages = list(initial_messages)
+    for iteration in range(max_iterations):
+        logger.info(
+            f"[{layer_tag}] {agent_tag} iteration {iteration + 1}/{max_iterations}"
+        )
+        response = invoke_fn(messages)  # 内含降级链 + 空响应重试
+        messages.append(response)
+
+        if not getattr(response, "tool_calls", None):
+            content = response.content or ""
+            return messages, content
+
+        for tc in response.tool_calls:
+            tool_name = tc.get("name", "")
+            tool_args = tc.get("args", {})
+            tool_id = tc.get("id", "")
+
+            tool_fn = None
+            for t in tools:
+                if t.name == tool_name:
+                    tool_fn = t
+                    break
+
+            if tool_fn is not None:
+                try:
+                    result = tool_fn.invoke(tool_args)
+                except Exception as e:
+                    result = f"[工具执行异常] {tool_name}: {e}"
+                    logger.error(
+                        f"[{layer_tag}] 工具 {tool_name} 执行失败: {e}"
+                    )
+            else:
+                result = f"[未知工具] {tool_name}"
+
+            result_str = (
+                _json.dumps(result, ensure_ascii=False)
+                if isinstance(result, dict) else str(result)
+            )
+            messages.append(ToolMessage(
+                content=result_str, tool_call_id=tool_id,
+            ))
+            logger.info(
+                f"[{layer_tag}] {agent_tag} 工具 {tool_name}: "
+                f"{result_str[:120]}..."
+            )
+
+    # 保底：耗尽迭代仍无纯文本（连续 tool_calls），取最后一条非工具文本
+    return messages, _extract_final_output(messages)
+
+
 def _make_modeler_node(
     config: dict,
     agent_name: str,
     response_key: str,
     history_key: str,
 ) -> Callable[[AgentState], dict[str, Any]]:
-    """创建建模师节点（辩论参与者）。"""
+    """创建建模师节点（辩论参与者，tool-calling 版，ADR-0003）。
+
+    绑定 model_search（模型知识库 RAG）+ web_search + run_code 三个工具，
+    使用 modeler 专用循环 _run_modeler_turn：一次发言以纯文本方案为终止条件，
+    调用工具只是辅助验证，max_iterations=10 仅作连续 tool_calls 的保底上限。
+    输出提取沿用 _extract_final_output；辩论状态更新逻辑与原实现一致。
+    """
+    from mathmodelingagents.tools import create_langchain_tools
+
     def node_fn(state: AgentState) -> dict[str, Any]:
         logger.info(f"[Layer2] {agent_name} 执行中...")
-
-        # ── 解析 max_tokens ──
-        max_tok = resolve_max_tokens(config, "agent", agent_name)
 
         debate = dict(state.get("model_debate_state", {}))
         round_count = debate.get("round_count", 0)  # 不递增，由 Manager 管理轮数
@@ -989,10 +1172,27 @@ def _make_modeler_node(
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_msg),
         ]
+
+        # ── 绑定工具：model_search + web_search + run_code（临时目录版）──
+        wanted = {"model_search_tool", "web_search_tool", "run_code_tool"}
+        tools = [t for t in create_langchain_tools() if t.name in wanted]
+
+        def _invoke_fn(msgs):
+            return invoke_with_tools_with_fallback(
+                config, "modeling", "agent", tools, msgs, agent_name,
+            )
+
         try:
-            result = invoke_with_fallback(config, "modeling", "agent", messages, agent_name, max_tokens=max_tok)
+            messages, result = _run_modeler_turn(
+                tools=tools,
+                layer_tag="Layer2",
+                agent_tag=agent_name,
+                max_iterations=10,
+                initial_messages=messages,
+                invoke_fn=_invoke_fn,
+            )
         except Exception as e:
-            logger.error(f"[Layer2] {agent_name} 全部降级耗尽: {e}")
+            logger.error(f"[Layer2] {agent_name} 发言失败: {e}")
             result = f"LLM 调用失败（全部降级耗尽）: {e}"
 
         # 更新辩论状态
@@ -1091,13 +1291,17 @@ def create_solver_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
 
         # ── Create tools scoped to output_dir ──
         tools = create_coding_agent_tools(output_dir)
-        llm = create_layer_llm(config, "implementation", "coder")
-        llm_with_tools = llm.bind_tools(tools)
+        llm = create_layer_llm(config, "implementation", "coder")  # 仅 summary 兜底用
+
+        def _invoke_fn(msgs):
+            return invoke_with_tools_with_fallback(
+                config, "implementation", "coder", tools, msgs, "SolverAgent",
+            )
 
         # 共享 agentic loop；summary 兜底仅 Solver 启用
         messages, final_output = _run_tool_loop(
             llm=llm,
-            llm_with_tools=llm_with_tools,
+            llm_with_tools=None,
             tools=tools,
             layer_tag="Layer3",
             agent_tag="SolverAgent",
@@ -1105,6 +1309,7 @@ def create_solver_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
             initial_messages=messages,
             sanitize=_sanitize_tool_pairing,
             on_summary_after_exhaust=_solver_summary,
+            invoke_fn=_invoke_fn,
         )
 
         retry_count = state.get("impl_retry_count", 0)
@@ -1171,19 +1376,23 @@ def create_viz_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
 
         # ── Create tools scoped to output_dir ──
         tools = create_coding_agent_tools(output_dir)
-        llm = create_layer_llm(config, "implementation", "coder")
-        llm_with_tools = llm.bind_tools(tools)
+
+        def _invoke_fn(msgs):
+            return invoke_with_tools_with_fallback(
+                config, "implementation", "coder", tools, msgs, "VizAgent",
+            )
 
         # 共享 agentic loop；Viz：max_iterations=10，无 summary / 读盘兜底
         messages, final_output = _run_tool_loop(
-            llm=llm,
-            llm_with_tools=llm_with_tools,
+            llm=None,
+            llm_with_tools=None,
             tools=tools,
             layer_tag="Layer3",
             agent_tag="VizAgent",
             max_iterations=10,  # 图表生成应该很快
             initial_messages=messages,
             sanitize=_sanitize_tool_pairing,
+            invoke_fn=_invoke_fn,
         )
 
         logger.info(
@@ -1366,8 +1575,11 @@ def create_paper_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
 
         # ── Create tools (read-only: no run_code) ──
         tools = create_paper_agent_tools(output_dir)
-        llm = create_layer_llm(config, "paper", "writer")
-        llm_with_tools = llm.bind_tools(tools)
+
+        def _invoke_fn(msgs):
+            return invoke_with_tools_with_fallback(
+                config, "paper", "writer", tools, msgs, "PaperAgent",
+            )
 
         # 共享 agentic loop；loop 内 sanitize 堵住 REVISE 裸回放损坏 pairing 的
         # latent bug（Paper-manager revision bug，本轮一并修）。
@@ -1376,8 +1588,8 @@ def create_paper_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
             return _paper_read_disk(output_dir, final_output, messages)
 
         messages, final_output = _run_tool_loop(
-            llm=llm,
-            llm_with_tools=llm_with_tools,
+            llm=None,
+            llm_with_tools=None,
             tools=tools,
             layer_tag="Layer4",
             agent_tag="PaperAgent",
@@ -1385,6 +1597,7 @@ def create_paper_agent(config: dict) -> Callable[[AgentState], dict[str, Any]]:
             initial_messages=messages,
             sanitize=_sanitize_tool_pairing,
             on_selfcheck=selfcheck,
+            invoke_fn=_invoke_fn,
         )
 
         round_num = (state.get("model_debate_state") or {}).get("round_count", 0) or 1

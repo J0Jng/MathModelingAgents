@@ -127,11 +127,11 @@ DEFAULT_CONFIG: dict = {
     # 超时配置（每层，秒）— 不限时间，确保推理模型完整跑完
     # ═══════════════════════════════════════════════
     "layer_timeouts": {
-        "problem": int(_env("layer_timeout_problem", "10800")),
-        "modeling": int(_env("layer_timeout_modeling", "10800")),
-        "implementation": int(_env("layer_timeout_implementation", "10800")),
-        "paper": int(_env("layer_timeout_paper", "10800")),
-        "sensitivity": int(_env("layer_timeout_sensitivity", "10800")),
+        "problem": int(_env("layer_timeout_problem", "180")),
+        "modeling": int(_env("layer_timeout_modeling", "180")),
+        "implementation": int(_env("layer_timeout_implementation", "180")),
+        "paper": int(_env("layer_timeout_paper", "180")),
+        "sensitivity": int(_env("layer_timeout_sensitivity", "180")),
     },
 
     # ═══════════════════════════════════════════════

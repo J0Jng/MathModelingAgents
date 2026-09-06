@@ -187,6 +187,26 @@ def build_config_from_args(args) -> dict:
     return config
 
 
+_LAYER_SHORT = {1: "问题分析", 2: "建模", 3: "实现", 4: "论文"}
+
+def _mode_label(config: dict) -> str:
+    """根据实际执行的 selected_layers 生成 banner 的 Mode 标签。
+
+    explain_mode（--from-layer1）优先；否则按 selected_layers 映射，
+    全层显示「完整流程」，单层/部分层用「L1→L2 (层名→层名)」形式。
+    """
+    if config.get("explain_mode"):
+        return "恢复 (L1 已有 → L2·L3 → 解释)"
+    selected = [l for l in (config.get("selected_layers") or []) if l in _LAYER_SHORT]
+    if not selected or set(selected) == set(_LAYER_SHORT):
+        return "完整流程 (L1→L4)"
+    nums = "→".join(f"L{l}" for l in sorted(selected))
+    names = "→".join(_LAYER_SHORT[l] for l in sorted(selected))
+    if len(selected) == 1:
+        return f"仅 Layer {selected[0]} ({_LAYER_SHORT[selected[0]]})"
+    return f"{nums} ({names})"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MathModelingAgents — 多智能体数学建模竞赛框架"
@@ -261,11 +281,7 @@ def main():
     from mathmodelingagents.default_config import resolve_sensitivity_mode
     sensitivity_mode = resolve_sensitivity_mode(config)
 
-    # 模式行长标签：--from-layer1 时明确说明只跑 L2→L3(+L5)→解释
-    if config.get("explain_mode"):
-        mode_label = "恢复 (L1 已有 → L2·L3 → 解释)"
-    else:
-        mode_label = "完整流程 (L1→L4)"
+    mode_label = _mode_label(config)
 
     # Banner 逐层展示实际解析出的模型（get_layer_model 与运行期完全一致，
     # 含 layer_model_overrides / provider 级覆盖 / 别名映射）。

@@ -543,6 +543,7 @@ SolverAgent 已经完成了所有求解工作并生成了 `results.json`。
 3. **每个 run_code 开头重新 json.load results.json**——每次调用是独立进程
 4. **plt.savefig('../results/fig_name.png', dpi=150, bbox_inches='tight')**
 5. **每个 run_code 结尾 print('图表已保存: xxx.png')**
+6. **🔴 禁止使用沙盒内部补丁**：不得写 `builtins.__import__ = ...`、不得引用 `_original_import`、`_safe_import` 等沙盒保留名字。沙盒已自动注入 matplotlib **Agg 后端**并配置中文字体，图表脚本直接 `import matplotlib.pyplot as plt` 即可——那些"绕过 socket/后端"的 hack 代码在沙盒外（代码验证阶段）会因找不到这些名字而崩溃。
 
 ## 🔴 必须生成的图表（至少 4 张）
 
