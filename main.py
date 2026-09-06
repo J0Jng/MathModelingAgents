@@ -67,11 +67,24 @@ def _verify_layer3_code(output_dir: str) -> str:
                 # 不拼 name/main 判断：preamble + 源码整体作为脚本顶层执行，
                 # 若源码自带 if __name__=='__main__' guard，顶层执行时恒为真分支。
                 sandboxed_src = build_preamble() + '\n' + script_src
-                result = subprocess.run(
-                    [sys.executable, '-c', sandboxed_src],
-                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120,
-                    cwd=str(code_dir),
-                )
+                # 落盘成 .py 再执行：-c 模式下 Python 不注入内置变量 __file__，
+                # 脚本里 dirname(abspath(__file__)) 会抛 NameError 造成假阴性。
+                # 临时文件必须落在 code_dir 内，__file__ 的 dirname 才解析到 code_dir，
+                # 使 "../results" 与沙盒产物落点一致。
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".py", prefix="_verify_",
+                    dir=code_dir, delete=False, encoding="utf-8",
+                ) as f_tmp:
+                    f_tmp.write(sandboxed_src)
+                    tmp_path = f_tmp.name
+                try:
+                    result = subprocess.run(
+                        [sys.executable, tmp_path],
+                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120,
+                        cwd=str(code_dir),
+                    )
+                finally:
+                    Path(tmp_path).unlink(missing_ok=True)
                 if result.returncode == 0:
                     passed += 1
                     stdout_preview = result.stdout.strip()[:300]
