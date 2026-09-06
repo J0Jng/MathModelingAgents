@@ -46,7 +46,7 @@ python main.py problem_2024a.md
 
 ### 交互式模型选择
 
-`python main.py 题目.md` 交互模式下，配置组装后会先弹出两个模型选择菜单（菜单项优先实时拉取当前 provider 的 `/models` 端点，失败时降级到内置静态清单，末尾恒有 `Custom model ID` 兜底）：
+`python main.py 题目.md` 交互模式下，配置组装后会先弹出两个模型选择菜单（菜单项严格来自 `cli/model_catalog.py` 的官方静态清单；清单中的逻辑别名如 `glm-5.3`、`kimi-k2.7-code`、`minimax-m3` 虽不在 `/models` 部署列表，chat 端点可直接使用）：
 
 ```
 Select Your [Quick-Thinking] LLM Engine (volcengine-plan):   # 快速思考模型
@@ -187,9 +187,10 @@ Layer 3 的 SolverAgent 可自主调用 `web_search` 查询数据字段含义、
 5 层流水线: L1 问题分析 → L2 数学建模(辩论) → L3 代码实现(Agentic) → L4 论文写作(Agentic) → L5 敏感性分析(可选)
 ```
 
-- **L1/L2/L5**：传统 LLM 节点链（System Prompt → 单次调用 → 输出）
-- **L3 SolverAgent**：有 `run_code` / `read_file` / `write_file` / `list_dir` / `web_search` 工具的 Agentic 循环（写→跑→修，最多 30 轮），VizAgent 负责图表生成
-- **L4 PaperAgent**：有 `read_file` / `list_dir` / `write_file` 工具的 Agentic 循环（逐节写→核实→改，最多 30 轮）
+- **L1/L5**：传统 LLM 节点链（System Prompt → 单次调用 → 输出）
+- **L2 建模师**：Agentic 循环，绑定 `model_search`（模型知识库 RAG）+ `web_search` + `run_code` 工具辅助验证，以纯文本建模方案为一次发言的终止条件（连续 tool_calls 保底上限 10 轮）
+- **L3 SolverAgent**：有 `run_code` / `read_file` / `write_file` / `list_dir` / `web_search` 工具的 Agentic 循环（写→跑→修，最多 30 轮），VizAgent 负责图表生成（最多 10 轮）
+- **L4 PaperAgent**：有 `read_file` / `list_dir` / `write_file` / `check_url` 工具的 Agentic 循环（逐节写→核实→改，最多 30 轮）
 - **总 Agent 数**：17（L1: 4, L2: 4, L3: 3, L4: 2, L5: 3, 模型解释: 1）
 
 ### 关键文件地图
@@ -226,18 +227,16 @@ python main.py problem_2024a.md --provider volcengine-plan
 # 用火山方舟 Coding Plan（订阅套餐，qwen3.7-max 自动映射为 deepseek-v4-pro）
 python main.py problem_2024a.md --provider volcengine
 
-# 启用敏感性分析
+# 启用/控制敏感性分析（裸 -s = always 强制启用；auto 交给 Layer 1 决策；never 强制跳过）
 python main.py problem_2024a.md -s
-
-# 恢复模式：从已完成的 Layer 1 数据出发，只跑 L2→L3(+L5) 产出模型解释文档
-python main.py problem_2024a.md --from-layer1 <已有输出目录>
+python main.py problem_2024a.md -s never
 ```
 
 ### 修改 Prompt 的正确方式
 
 1. 找到 `prompt_templates.py` 中对应的 `get_XXX_prompt()` 函数
 2. 所有 prompt 函数是**无参数纯静态字符串**（为了 API 缓存）。不要在 prompt 中注入变量，动态值通过 `_build_context()` 在 user message 中提供
-3. 修改后运行 `pytest tests/test_layer3_layer4.py -v` 验证
+3. 修改后用 `--max-rounds 1 --provider deepseek` 小规模跑一轮冒烟验证（单元测试套件已移除，见下文「验证」）
 
 ### 添加新 Agent 的步骤
 
@@ -250,19 +249,25 @@ python main.py problem_2024a.md --from-layer1 <已有输出目录>
 
 ### 沙盒工具的关键约束
 
-- **网络模块**（socket, requests, urllib 等）被 import hook 阻断
+- **网络模块**（socket, requests, urllib 等）被 import hook 阻断；`urllib.parse` 作为安全子模块精确豁免（纯解析无网络，matplotlib 字体配置内部依赖）
 - **子进程和线程**（subprocess, threading）放行（matplotlib 内部需要）
 - **每次 run_code 是独立进程**，变量不跨调用保留。跨调用数据通过 write_file → read_file 传递
+- **单次 run_code 硬上限 300s**（`MAX_RUN_CODE_TIMEOUT`），Agent 传入更大的 timeout 也会被钳制；复杂求解需拆分为多个小执行单元
 - **中文字体**：沙盒自动检测 SimHei/Microsoft YaHei，无字体时 Agent 应改用英文标签
 
-### 测试
+### 验证
+
+单元测试套件（`tests/`）已于 2026-09 移除，当前验证方式：
 
 ```bash
-# 单元测试（无需 API key）
-pytest tests/test_layer3_layer4.py tests/test_font_detection.py -v
+# 小规模冒烟：一轮辩论完整流程（最快路径，需 API key）
+python main.py problem_2024a.md --max-rounds 1 --provider deepseek
 
-# API 连通性测试（需要 API key）
-python tests/test_api_connectivity.py
+# 从已有 Layer 1 恢复，只跑后续层（调试某层推荐）
+python main.py problem_2024a.md --from-layer1 <已有输出目录> --max-rounds 1
+
+# RAG 检索冒烟（无需 API key）
+.venv/Scripts/python.exe -c "from mathmodelingagents.knowledge import search_models; print(search_models('小样本 指数增长 预测', top_k=1)[0]['name'])"
 ```
 
 ## 支持模型
@@ -295,7 +300,7 @@ Agent Plan 模型池（11 个）：`ark-code-latest`、`doubao-seed-2.1-turbo`�
 ### 已知不可用 / 风险提示
 
 - `glm-5.2` · `glm-5.1` 在 opencode 通道的长中文数学建模 prompt 下会返回空内容，已被排除。
-- `kimi-k2.7-code` 在 **OpenCode Go 后端**曾因长 prompt 返空被移除，且只接受 `temperature=1`；本次在 **volcengine-plan 通道**重新启用为 L3 coder（火山原生端点行为不同），正式跑题前请先用 `scripts/probe_model_quality.py` 实测输出质量。
+- `kimi-k2.7-code` 在 **OpenCode Go 后端**曾因长 prompt 返空被移除，且只接受 `temperature=1`；本次在 **volcengine-plan 通道**重新启用为 L3 coder（火山原生端点行为不同），正式跑题前请先做小 prompt 实测输出质量（探针脚本 `scripts/probe_model_quality.py` 已随测试清理移除，可直接用任一题目 md + `--max-rounds 1` 冒烟）。
 
 ## 模型知识库 RAG
 
@@ -327,16 +332,10 @@ export HF_HUB_DISABLE_XET=1
 **第三步 · 验证下载成功**
 
 ```bash
-.venv/Scripts/python.exe -m pytest tests/test_knowledge_retrieval.py::test_real_retrieval_smoke -q
-```
-
-应显示 `1 passed`（而非 `1 skipped`），表示真实 embedding 检索已可用；也可直接检索冒烟：
-
-```bash
 .venv/Scripts/python.exe -c "from mathmodelingagents.knowledge import search_models; print(search_models('小样本 指数增长 预测', top_k=1)[0]['name'])"
 ```
 
-首条应接近「灰色预测 GM(1,1)」。
+首条应接近「灰色预测 GM(1,1)」，表示真实 embedding 检索已可用。
 
 模型已下载后，`search_models` 走纯离线推理（`local_files_only=True`），运行期无需联网。
 
@@ -377,14 +376,17 @@ python main.py <题目文件> [选项]
 
 选项:
   --output, -o NAME     输出文件夹名（默认自动生成）
-  --sensitivity, -s     启用 Layer 5 敏感性分析
+  --sensitivity, -s [auto|always|never]
+                        敏感性模式（默认 auto，由 Layer 1 分析题目后决策；
+                        裸 -s 等价 always 强制启用，never 强制跳过）
   --max-rounds, -r N    每层最大辩论轮次（默认 10）
   --provider, -p        指定 LLM provider（opencode / deepseek / volcengine / volcengine-plan）
-    --from-layer1 DIR     从已完成的 Layer 1 输出目录恢复，只跑 L2→L3(+L5) 产出模型解释文档
+  --from-layer1 DIR     从已完成的 Layer 1 输出目录恢复，只跑 L2→L3(+L5) 产出模型解释文档
 
   示例:
     python main.py problem_2024a.md
     python main.py problem_2024a.md -s -o my_solution
+    python main.py problem_2024a.md -s never          # 强制跳过敏感性分析
     python main.py problem_2024a.md --from-layer1 results/problem_2024a   # 恢复模式，产出模型解释文档
 ```
 
@@ -393,6 +395,9 @@ python main.py <题目文件> [选项]
 ```
 MathModelingAgents/
 ├── main.py                          # 入口 + 代码验证
+├── cli/
+│   ├── model_catalog.py             # 各 provider 官方静态模型清单（交互菜单数据源）
+│   └── model_picker.py              # 交互式 Quick/Deep 模型选择（questionary）
 ├── pyproject.toml
 ├── .env.example                     # 配置模板（复制为 .env）
 ├── .gitignore
@@ -406,18 +411,24 @@ MathModelingAgents/
     │       ├── prompt_templates.py  # 全部 System Prompt（静态，可缓存）
     │       └── agent_states.py      # AgentState 类型定义
     │
+    ├── knowledge/                   # 模型知识库 RAG（Layer 2 候选模型池）
+    │   ├── model_library.json       # 52 条数学模型条目
+    │   ├── model_library_vectors.npz# 预计算向量库（随 git 提交）
+    │   └── retrieval.py             # 语义检索（bge-small-zh-v1.5, 本地 ONNX）
+    │
     ├── llm_clients/
     │   └── __init__.py              # LLM 客户端 + 统一降级链
     │
     ├── tools/
     │   ├── __init__.py              # 沙盒代码执行 + LangChain Tool 封装
-    │   └── web_search.py            # Web 搜索（Tavily / ddgs）
+    │   └── web_search.py            # Web 搜索（Tavily / ddgs）+ check_url
     │
     ├── graph/
     │   ├── setup.py                 # LangGraph StateGraph 构建
     │   ├── modeling_graph.py        # 主入口类 MathModelingGraph
     │   ├── conditional_logic.py     # 辩论/重试/循环路由
     │   ├── propagation.py           # 初始状态 + 图执行参数
+    │   ├── checkpointer.py          # 检查点（可选）
     │   └── recovery.py              # Layer 1 状态恢复（--from-layer1）
     │
     └── reporting.py                 # 增量写盘 + 最终报告汇总

@@ -2,6 +2,7 @@
 
 > 本文件说明框架中每个 Agent 在四种 LLM provider 下的模型分配，以及路由解析、降级链、生成参数。
 > 配置实现在 `mathmodelingagents/default_config.py` 与 `mathmodelingagents/llm_clients/__init__.py`，本文档与代码保持同步。
+> 模型矩阵由 `get_layer_model()` 在四 provider 下逐 Agent 实际执行生成，非手写推演。
 
 ## 使用方式
 
@@ -26,7 +27,8 @@ python main.py 题目.md --provider opencode --from-layer1 <已有输出目录>
 
 ## 统一模型配置表
 
-> 四列 provider 为每个 Agent 实际解析出的最终模型。`deep_think_llm = deepseek-v4-pro`，`quick_think_llm = deepseek-v4-flash`。
+> 四列 provider 为每个 Agent 实际解析出的最终模型（含别名映射后的结果）。
+> `deep_think_llm = deepseek-v4-pro`，`quick_think_llm = deepseek-v4-flash`。
 
 | 层 | Agent | role | opencode | deepseek | volcengine (Coding) | volcengine-plan (Agent) |
 |----|-------|------|----------|----------|---------------------|-------------------------|
@@ -60,6 +62,8 @@ L3 coder（solver/viz）       → deepseek-v4-pro   （默认）/ kimi-k2.7-cod
 L4 writer（paper_agent）     → qwen3.7-max       （默认，中文论文）/ minimax-m3（volcengine-plan）
 L1/L5 agent 与 explainer     → deepseek-v4-flash 或 deepseek-v4-pro（见上表）
 ```
+
+deepseek 官方 API 模式走极简规则：`manager → deep_think_llm`，其余角色一律 `quick_think_llm`，故 L2 建模师、L3 coder、L4 writer、explainer 均跌到 flash。
 
 ---
 
@@ -115,9 +119,9 @@ model = provider_model_aliases[provider].get(model, model)               # 别�
 4) fallback provider + flash 模型  （deepseek 官方 + deepseek-v4-flash）
 ```
 
-- 每步内部 3 次指数退避重试（2s → 4s → 8s），仅对瞬态故障（429/5xx/超时等）重试。
+- 每步内部 3 次指数退避重试（2s → 4s → 8s），仅对瞬态故障（429/500/502/503/504、超时、连接失败等）重试。
 - 纯 400 等不可重试错误立即进入下一步降级。
-- 输出 < 10 字符视为模型故障，触发重试/降级。
+- 输出 < 10 字符视为模型故障（`EmptyLLMResponseError`），触发重试/降级。
 - 4 步全部失败抛出 `RuntimeError`；命中降级路径时输出会附加 `[降级 provider/model]` 标记。
 - `fallback_provider` 默认 `deepseek`，可用 `fallback_base_url` 自定义。
 
@@ -129,9 +133,17 @@ model = provider_model_aliases[provider].get(model, model)               # 别�
 |------|-----|------|
 | `default_max_tokens` | **16384** | 所有 Agent 统一上限（`max_tokens_overrides` 当前为空） |
 | `default_temperature` | **0.2** | 默认温度 |
-| `temperature_overrides` | `manager: 0.1` `coder: 0.0` `writer: 0.5` | 温度解析优先级：`agent_name > role > default` |
+| `temperature_overrides` | `manager: 0.1` `coder: 0.0` `writer: 0.5` | 温度按 **role** 解析（key 为 role），否则回落 `default_temperature` |
 
 `volcengine-plan` 端点额外设置 `reasoning_effort = "medium"`：Agent Plan 的 `max_completion_tokens` 是推理+正文总预算，显式压制推理暴走，避免正文返空（已实测）。
+
+---
+
+## 超时配置
+
+所有层的 HTTP 请求超时统一 **180s**（`layer_timeouts`，可通过 `MATHMODELING_LAYER_TIMEOUT_*` 逐层覆盖），超时抛 `OpenAITimeoutError` 后走重试/降级链。
+
+> 注意：单 LLM 调用超时 180s，不等同于「每层总时长」；Layer 3 等层内部还有自我迭代循环（写→跑→修），单次 `run_code` 沙盒执行另有独立超时（见 `default_config.code_execution.timeout`，默认 30s）。
 
 ---
 
@@ -144,8 +156,6 @@ model = provider_model_aliases[provider].get(model, model)               # 别�
 | `volcengine` | `https://ark.cn-beijing.volces.com/api/coding/v3` | `VOLCENGINE_API_KEY` | 火山方舟 Coding Plan；`qwen3.7-max` 自动别名到 `deepseek-v4-pro` |
 | `volcengine-plan` | `https://ark.cn-beijing.volces.com/api/plan/v3` | `VOLCENGINE_PLAN_API_KEY`（fallback `VOLCENGINE_API_KEY`） | 火山方舟 Agent Plan；L3 coder→kimi、L4 writer→minimax-m3 |
 
-> 超时：所有层 `layer_timeouts` 统一 **10800s（3h）**，确保推理模型完整跑完。
-
 ---
 
 ## 环境变量
@@ -154,29 +164,32 @@ model = provider_model_aliases[provider].get(model, model)               # 别�
 # provider（可选，默认 opencode）
 export MATHMODELING_LLM_PROVIDER=volcengine-plan   # opencode / deepseek / volcengine / volcengine-plan
 
-# API Key（必须，写入 ~/.hermes/.env 或项目 .env）
+# API Key（必须，写入项目 .env）
 OPENCODE_GO_API_KEY=sk-...          # opencode
 DEEPSEEK_API_KEY=sk-...             # deepseek / 降级兜底
 VOLCENGINE_API_KEY=...              # volcengine (Coding Plan)
 VOLCENGINE_PLAN_API_KEY=...         # volcengine-plan (Agent Plan，订阅后从控制台换取)
 
-# 覆盖各层模型（JSON，深合并到代码默认值）
-MATHMODELING_LAYER_MODEL_OVERRIDES={"paper":{"writer":"qwen3.7-max"}}
-
-# 默认模型值（仅作默认，不关闭交互）
+# 默认模型值（仅作默认值，不关闭交互）
 MATHMODELING_QUICK_THINK_LLM=deepseek-v4-flash
 MATHMODELING_DEEP_THINK_LLM=deepseek-v4-pro
 
 # 显式设为 1/true/yes/on 时跳过 CLI 交互式模型选择（适合 CI / 脚本 / 无 TTY）。
-# 交互模式下菜单优先实时拉取 provider 的 /models 端点，失败降级到
-# cli/model_catalog.py 静态清单，选中值最高优先级完全覆盖 provider 级硬编码。
+# 交互模式下菜单优先实时拉取 provider 静态清单，选中值最高优先级完全覆盖 provider 级硬编码。
 MATHMODELING_SKIP_MODEL_PROMPT=1
 
-# 其他常用
+# 超时与生成参数
+MATHMODELING_LAYER_TIMEOUT_MODELING=180        # 逐层覆盖，默认全部 180s
+MATHMODELING_DEFAULT_MAX_TOKENS=16384          # 统一输出上限
+
+# 辩论 / 重试 / 层控制
 MATHMODELING_MAX_MODELING_ROUNDS=5
 MATHMODELING_MAX_REVISION_ROUNDS=8
-MATHMODELING_SENSITIVITY_MODE=auto     # auto / always / never
+MATHMODELING_MAX_IMPL_RETRIES=3
+MATHMODELING_SENSITIVITY_MODE=auto             # auto / always / never
 ```
+
+> 注意：`layer_model_overrides` 等模型分配现由 CLI 交互选择与 `provider_layer_model_overrides` 控制，**不再提供 `MATHMODELING_LAYER_MODEL_OVERRIDES` 环境变量覆盖**（该链路已移除）。
 
 ---
 
@@ -191,11 +204,11 @@ MATHMODELING_SENSITIVITY_MODE=auto     # auto / always / never
 
 ## 适用场景速查
 
-| 场景 | 命令 | 预计耗时 |
-|------|------|---------|
-| 快速验证 | `--provider deepseek --max-rounds 1` | ~20 min |
-| 标准运行 | `--provider opencode --max-rounds 2` | ~60-90 min |
-| 正式比赛（高质量） | `--provider opencode --max-rounds 3` | ~90-120 min |
-| 火山方舟 Agent Plan | `--provider volcengine-plan --max-rounds 2` | ~60-90 min |
-| 火山方舟 Coding Plan | `--provider volcengine --max-rounds 2` | ~60-90 min |
+| 场景 | 命令 | 说明 |
+|------|------|------|
+| 快速验证 | `--provider deepseek --max-rounds 1` | 仅 flash/pro，最快 |
+| 标准运行 | `--provider opencode --max-rounds 2` | 模型池丰富 |
+| 正式比赛（高质量） | `--provider opencode --max-rounds 3` | 多轮辩论 |
+| 火山方舟 Agent Plan | `--provider volcengine-plan --max-rounds 2` | 订阅套餐，专属 key |
+| 火山方舟 Coding Plan | `--provider volcengine --max-rounds 2` | 普通方舟 key |
 | 调试某层 | `--provider opencode --from-layer1 <dir>`（L1 已完成） | 仅后续层耗时 |
