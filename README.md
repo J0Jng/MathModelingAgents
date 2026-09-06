@@ -149,7 +149,7 @@ prefix caching 可以命中。动态值（路径、轮次、重试次数等）�
 ### 增量输出 · 崩溃不丢数据
 
 每个 Agent 完成工作后**立即将输出写入磁盘**。即使后续层崩溃，已完成层的内容不会丢失。
-重新运行 `--start-layer` 可以从中断的层继续。
+崩溃后可用 `--from-layer1 <dir>` 从既有 Layer 1 输出的恢复模式继续。
 
 ### 中文图表渲染保护
 
@@ -214,8 +214,8 @@ Layer 3 的 SolverAgent 可自主调用 `web_search` 查询数据字段含义、
 # 运行完整流程
 python main.py problem_2024a.md
 
-# 只跑代码实现 + 论文（跳过前面的分析，调试用）
-python main.py problem_2024a.md --start-layer 3
+# 从已完成的 Layer 1 输出恢复，只跑 L2→L3(+L5)，产出模型解释文档（调试/迭代推荐）
+python main.py problem_2024a.md --from-layer1 <已有Layer1目录>
 
 # 只用 DeepSeek 官方 API
 python main.py problem_2024a.md --provider deepseek
@@ -297,6 +297,59 @@ Agent Plan 模型池（11 个）：`ark-code-latest`、`doubao-seed-2.1-turbo`�
 - `glm-5.2` · `glm-5.1` 在 opencode 通道的长中文数学建模 prompt 下会返回空内容，已被排除。
 - `kimi-k2.7-code` 在 **OpenCode Go 后端**曾因长 prompt 返空被移除，且只接受 `temperature=1`；本次在 **volcengine-plan 通道**重新启用为 L3 coder（火山原生端点行为不同），正式跑题前请先用 `scripts/probe_model_quality.py` 实测输出质量。
 
+## 模型知识库 RAG
+
+Layer 2 辩论前会按题目特点从内置模型知识库（`mathmodelingagents/knowledge/model_library.json`，52 条）中检索候选模型池（Top-5），注入三位建模师第一轮作为参考起点（可超越池子）；建模师还可用 `model_search` 工具按需补充检索（ADR-0003）。
+
+**Embedding 模型**：`BAAI/bge-small-zh-v1.5`（512 维，fastembed 本地 ONNX 推理，不引入 torch）。
+
+模型文件（约 91MB：`model_optimized.onnx` + tokenizer/config）是二进制，已在 `.gitignore` 中忽略、**不随 git 提交**；而预计算的向量库 `knowledge/model_library_vectors.npz`（52×512）随仓库提交。因此 clone 到新环境后需自行补下载模型：
+
+**第一步 · 判断是否需要下载**
+
+检查模型目录是否存在：
+
+```bash
+ls mathmodelingagents/knowledge/models/
+```
+
+- 已有 `models--Qdrant--bge-small-zh-v1.5/`（含 snapshot）→ 已就绪，跳过下载，直接可用。
+- 目录为空或不存在 → 执行下一步。
+
+**第二步 · 下载模型**（国内网络实测：直连 HuggingFace 会 ConnectTimeout，不禁 xet 会 CAS 401，两个环境变量缺一不可）
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+export HF_HUB_DISABLE_XET=1
+.venv/Scripts/python.exe scripts/build_model_library.py --download-model
+```
+
+**第三步 · 验证下载成功**
+
+```bash
+.venv/Scripts/python.exe -m pytest tests/test_knowledge_retrieval.py::test_real_retrieval_smoke -q
+```
+
+应显示 `1 passed`（而非 `1 skipped`），表示真实 embedding 检索已可用；也可直接检索冒烟：
+
+```bash
+.venv/Scripts/python.exe -c "from mathmodelingagents.knowledge import search_models; print(search_models('小样本 指数增长 预测', top_k=1)[0]['name'])"
+```
+
+首条应接近「灰色预测 GM(1,1)」。
+
+模型已下载后，`search_models` 走纯离线推理（`local_files_only=True`），运行期无需联网。
+
+**建库脚本**：`scripts/build_model_library.py` 对 52 条模型条目（name + traits + usage）预计算向量并生成 `knowledge/model_library_vectors.npz`。向量库已随 git 提交，仅在**更换 embedding 模型**或**改动 `model_library.json` 条目**时才需重建：
+
+```bash
+.venv/Scripts/python.exe scripts/build_model_library.py            # 模型已存在时，仅重建向量库
+```
+
+**一致性铁律**：更换 embedding 模型后**必须重跑建库脚本重建向量库**，否则检索会因 names/维度不一致而退化为现场计算（模型也不可用时进一步 fail-open 为全量谱系注入）。
+
+fail-open 行为：模型未下载 / 向量化失败 / 结构化提炼失败时，候选池自动降级为全量模型谱系注入，不阻塞主流程。
+
 ## 配置
 
 所有配置通过 `.env` 文件管理，完整列表见 `.env.example`。核心配置项：
@@ -327,14 +380,12 @@ python main.py <题目文件> [选项]
   --sensitivity, -s     启用 Layer 5 敏感性分析
   --max-rounds, -r N    每层最大辩论轮次（默认 10）
   --provider, -p        指定 LLM provider（opencode / deepseek / volcengine / volcengine-plan）
-  --start-layer N       从第 N 层开始（1-5，调试用）
-  --from-layer1 DIR     从已完成的 Layer 1 输出目录恢复，只跑 L2→L3(+L5) 产出模型解释文档（与 --start-layer 互斥）
+    --from-layer1 DIR     从已完成的 Layer 1 输出目录恢复，只跑 L2→L3(+L5) 产出模型解释文档
 
-示例:
-  python main.py problem_2024a.md
-  python main.py problem_2024a.md -s -o my_solution
-  python main.py problem_2024a.md --start-layer 4    # 只重跑论文
-  python main.py problem_2024a.md --from-layer1 results/problem_2024a   # 恢复模式，产出模型解释文档
+  示例:
+    python main.py problem_2024a.md
+    python main.py problem_2024a.md -s -o my_solution
+    python main.py problem_2024a.md --from-layer1 results/problem_2024a   # 恢复模式，产出模型解释文档
 ```
 
 ## 项目结构
