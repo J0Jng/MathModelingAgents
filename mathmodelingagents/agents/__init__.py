@@ -5,6 +5,7 @@
 所有节点通过 langchain_openai.ChatOpenAI 调用 LLM。
 """
 
+import json
 import logging
 import re
 from typing import Any, Callable, NamedTuple
@@ -38,12 +39,58 @@ def _record(state: AgentState, agent: str, layer: str, role: str,
     return records
 
 
+def _parse_sensitivity_json(text: str) -> dict:
+    """容错解析模型返回的 JSON：剥离 ```json 围栏 → 正则取首个 {...} 块 → json.loads。失败 raise ValueError。"""
+    cleaned = text.strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned)
+    if fence:
+        cleaned = fence.group(1).strip()
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if not match:
+        raise ValueError(f"模型输出中未找到 JSON 对象: {text[:200]!r}")
+    try:
+        obj = json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"模型输出 JSON 解析失败: {e}") from e
+    if not isinstance(obj, dict):
+        raise ValueError(f"模型输出 JSON 不是对象: {type(obj).__name__}")
+    return obj
+
+
+def _parse_traits_json(text: str) -> tuple[list[str], str]:
+    """容错解析候选池提炼返回的 JSON：剥围栏 → 正则取首个 {...} → json.loads → 取 problem_traits/description。
+
+    与 _parse_sensitivity_json 同款容错（火山通道下模型常回 markdown 文本非纯 JSON）。
+    字段缺失回退空值；解析失败 raise ValueError（由 _run_model_candidate_search 外层 except 兜底降级全量谱系）。
+    """
+    cleaned = text.strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned)
+    if fence:
+        cleaned = fence.group(1).strip()
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if not match:
+        raise ValueError(f"模型输出中未找到 JSON 对象: {text[:200]!r}")
+    try:
+        obj = json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"模型输出 JSON 解析失败: {e}") from e
+    if not isinstance(obj, dict):
+        raise ValueError(f"模型输出 JSON 不是对象: {type(obj).__name__}")
+    traits_raw = obj.get("problem_traits") or []
+    if isinstance(traits_raw, str):
+        traits_raw = [traits_raw]
+    traits = [str(t).strip() for t in traits_raw if str(t).strip()]
+    description = str(obj.get("description") or "").strip()
+    return traits, description
+
+
 def _run_sensitivity_decision(config: dict, problem_report: str) -> tuple[bool, str]:
     """Layer 1 敏感性决策（ADR-0001）：结构化 LLM 调用判定本题是否需要敏感性分析。
 
-    ProblemManager 裁决 CONCLUDE 后调用，使用 problem 层 manager 档模型 +
-    function calling（with_structured_output），Manager 本体保持无工具。
-    任何异常（含结构化输出形状异常）fail-open 默认执行。
+    ProblemManager 裁决 CONCLUDE 后调用，走统一降级链（invoke_with_fallback）的
+    普通文本调用 + 容错 JSON 解析（不用 with_structured_output——火山通道下模型
+    回 markdown 文本非 JSON，pydantic 报 json_invalid），Manager 本体保持无工具。
+    任何异常（含解析失败）fail-open 默认执行。
 
     Args:
         config: 全局配置。
@@ -52,29 +99,24 @@ def _run_sensitivity_decision(config: dict, problem_report: str) -> tuple[bool, 
     Returns:
         (enabled, reason) 二元组。
     """
-    from pydantic import BaseModel, Field
-
-    class SensitivityDecision(BaseModel):
-        """敏感性决策结构化 schema。"""
-        enabled: bool = Field(description="本题是否需要敏感性分析")
-        reason: str = Field(description="一两句判断理由：题目是否存在值得扰动检验的关键参数、权重或不确定假设")
-
     try:
-        # 温度不显式传：manager 角色由 temperature_overrides 解析为 0.1（低温），
-        # 避免绕过配置链
-        llm = create_layer_llm(config, "problem", "manager")
-        structured = llm.with_structured_output(SensitivityDecision)
-        decision = structured.invoke([
+        messages = [
             SystemMessage(content=(
                 "你是数学建模竞赛的评审专家。根据题目分析报告，判断本题是否需要敏感性分析"
                 "（灵敏度分析）：题目是否存在值得扰动检验的关键参数、权重或不确定假设。"
                 "通常含优化参数、预测模型或权重设定的问题需要；"
                 "纯描述统计或数据呈现类问题不需要。"
+                "请**只输出一个 JSON 对象**，形如 {\"enabled\": true/false, \"reason\": \"…\"}，"
+                "不要输出任何 markdown 或解释文字。"
             )),
             HumanMessage(content=f"## 题目分析报告\n\n{problem_report}\n\n请给出敏感性决策。"),
-        ])
-        enabled = bool(decision.enabled)
-        reason = str(getattr(decision, "reason", "") or "").strip() or "（未给出理由）"
+        ]
+        # 温度不显式传：manager 角色由 temperature_overrides 解析为 0.1（低温），
+        # 避免绕过配置链；max_tokens=512 足够输出一个小 JSON 对象
+        text = invoke_with_fallback(config, "problem", "manager", messages, "sensitivity_decision", max_tokens=512)
+        obj = _parse_sensitivity_json(text)
+        enabled = bool(obj.get("enabled"))
+        reason = str(obj.get("reason") or "").strip() or "（未给出理由）"
         logger.info(f"[problem] 敏感性决策: {'启用' if enabled else '跳过'} - {reason}")
         return enabled, reason
     except Exception as e:
@@ -164,7 +206,7 @@ class CandidatePoolResult(NamedTuple):
 def _run_model_candidate_search(config: dict, problem_report: str) -> CandidatePoolResult:
     """Layer 1 候选模型池提炼（ADR-0003）：ProblemManager CONCLUDE 后结构化调用。
 
-    用 problem 层 manager 档模型 + with_structured_output 提炼「题目特点需求」
+    用 problem 层 manager 档模型 + 普通文本调用 + 容错 JSON 解析提炼「题目特点需求」
     （3-8 个纯中文特点标签 + 一两句描述），编码为 query 向量检索模型知识库
     Top-5，格式化为 markdown 候选池文本供 Layer 2 第一轮注入。
 
@@ -180,8 +222,6 @@ def _run_model_candidate_search(config: dict, problem_report: str) -> CandidateP
         - source="full_library"：降级为全量谱系，text 为 52 条 markdown，query 为空；
         - source="empty"：连全量谱系都加载失败，text 和 query 均为空。
     """
-    from pydantic import BaseModel, Field
-
     from mathmodelingagents.knowledge import (
         build_query,
         format_model_entries,
@@ -189,29 +229,21 @@ def _run_model_candidate_search(config: dict, problem_report: str) -> CandidateP
         search_models,
     )
 
-    class ProblemTraits(BaseModel):
-        """题目特点需求结构化 schema。"""
-        problem_traits: list[str] = Field(
-            description="3-8 个纯中文题目特点标签，如：小样本、指数增长、多目标优化、离散决策",
-        )
-        description: str = Field(
-            description="一两句纯中文的题目特点描述：数据形态、求解目标、关键难点",
-        )
-
     try:
-        llm = create_layer_llm(config, "problem", "manager")
-        structured = llm.with_structured_output(ProblemTraits)
-        parsed = structured.invoke([
+        messages = [
             SystemMessage(content=(
                 "你是数学建模竞赛的方法选型专家。根据题目分析报告，提炼本题的"
                 "「题目特点需求」：3-8 个纯中文特点标签（数据形态/目标类型/约束特征，"
                 "如：小样本、非线性、多目标、时序预测），加一两句特点描述。"
                 "标签用于检索候选数学模型知识库，请贴题目实际特征，不要罗列模型名。"
+                "请**只输出一个 JSON 对象**，形如 "
+                '{"problem_traits": ["小样本", "多目标优化"], "description": "……"}，'
+                "不要输出任何 markdown 代码块或解释文字。"
             )),
-            HumanMessage(content=f"## 题目分析报告\n\n{problem_report}\n\n请提炼题目特点。"),
-        ])
-        traits = [t.strip() for t in (parsed.problem_traits or []) if t and t.strip()]
-        description = str(getattr(parsed, "description", "") or "").strip()
+            HumanMessage(content=f"## 题目分析报告\n\n{problem_report}\n\n请提炼题目特点并输出 JSON。"),
+        ]
+        text = invoke_with_fallback(config, "problem", "manager", messages, "model_candidate_search", max_tokens=512)
+        traits, description = _parse_traits_json(text)
         query = build_query(traits, description)
         results = search_models(query, top_k=5)
         logger.info(
@@ -232,7 +264,8 @@ def _extract_final_output(messages: list) -> str:
     """从消息列表中提取最后一个非工具调用的文本输出。
 
     从消息列表末尾反向遍历，找到第一条有内容且不含 tool_calls
-    且不是 tool 类型消息的内容，作为 Agent 的最终文本输出。
+    的 AIMessage（type=='ai'）——排除把输入 HumanMessage 误当输出的
+    回显 bug（2026-09-07 B题实跑发现）。
 
     Args:
         messages: LangChain 消息列表。
@@ -244,7 +277,9 @@ def _extract_final_output(messages: list) -> str:
         content = getattr(msg, "content", "") or ""
         has_tools = bool(getattr(msg, "tool_calls", None))
         tool_msg = getattr(msg, "type", "") == "tool"
-        if content and not has_tools and not tool_msg:
+        msg_type = getattr(msg, "type", "")
+        is_ai = msg_type == "ai"
+        if is_ai and content and not has_tools:
             return content
     return ""
 
@@ -675,6 +710,20 @@ def _format_file_evidence(evidence: dict) -> str:
 # 基础 LLM 节点工厂
 # ═══════════════════════════════════════════════════════════════════
 
+def _take_last_rounds(history: str, k: int) -> str:
+    r"""截取辩论历史中最近 k 轮发言。
+
+    轮次分隔符为独占一行的 `--- 第 N 轮 ---`（见 _make_modeler_node 的累积格式）。
+    用 ^--- 第 \d+ 轮 ---\s*$（MULTILINE）匹配，避免误伤发言正文里内联的「第 N 轮」字样。
+    轮段数 <= k 时原样返回（不裁剪）；history 为空返回空串。
+    """
+    import re
+    markers = list(re.finditer(r'^--- 第 \d+ 轮 ---\s*$', history, flags=re.MULTILINE))
+    if len(markers) <= k:
+        return history
+    return history[markers[-k].start():]
+
+
 def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> str:
     """根据层和角色，从 state 中构建传给 LLM 的上下文。
 
@@ -690,6 +739,8 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
         problem = state.get("problem_description", "")
         if problem:
             parts.append(f"## 题目内容\n\n{problem}")
+        if state.get("attachment_summary"):
+            parts.append(f"## 附件数据摘要（全量数据请用 read_file/run_code 按文件读取，勿把表格塞进回答）\n\n{state['attachment_summary']}")
 
     # ── 跨层上下文：只传精华摘要 ──
     # 建模层和实现层已有完整的前层输出（problem_report / model_spec），摘要冗余
@@ -720,12 +771,14 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
         debate = state.get("model_debate_state", {})
         if candidates and debate.get("round_count", 0) <= 1:
             parts.append(f"## 候选模型池（参考起点，可超越）\n\n{candidates}")
+        # ── 滚动窗口：只喂最近 K 轮历史，字段本身仍全量累积（报告依赖全量）──
+        window = config.get("debate_history_window", 3)
         if debate.get("a_history"):
-            parts.append(f"## 建模师 A 历史发言\n\n{debate['a_history']}")
+            parts.append(f"## 建模师 A 历史发言\n\n{_take_last_rounds(debate['a_history'], window)}")
         if debate.get("b_history"):
-            parts.append(f"## 建模师 B 历史发言\n\n{debate['b_history']}")
+            parts.append(f"## 建模师 B 历史发言\n\n{_take_last_rounds(debate['b_history'], window)}")
         if debate.get("c_history"):
-            parts.append(f"## 建模师 C 历史发言\n\n{debate['c_history']}")
+            parts.append(f"## 建模师 C 历史发言\n\n{_take_last_rounds(debate['c_history'], window)}")
         if debate.get("current_a_response"):
             parts.append(f"## 建模师 A 本轮发言\n\n{debate['current_a_response']}")
         if debate.get("current_b_response"):
@@ -785,7 +838,10 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
     # 元信息
     debate = state.get("model_debate_state", {})
     round_info = debate.get("round_count", 0)
-    max_rounds = config.get("max_debate_rounds", 10)
+    if layer == "modeling":
+        max_rounds = config.get("max_modeling_rounds", 5)
+    else:
+        max_rounds = config.get("max_debate_rounds", 10)
     remaining = max(0, max_rounds - round_info)
     current_layer_info = state.get('current_layer', layer)
     output_dir = config.get("output_dir", "output")
@@ -1126,12 +1182,24 @@ def _run_modeler_turn(
     from langchain_core.messages import ToolMessage
 
     messages = list(initial_messages)
+    consecutive_tool_only = 0
     for iteration in range(max_iterations):
         logger.info(
             f"[{layer_tag}] {agent_tag} iteration {iteration + 1}/{max_iterations}"
         )
         response = invoke_fn(messages)  # 内含降级链 + 空响应重试
         messages.append(response)
+
+        if getattr(response, "tool_calls", None) and not (response.content or "").strip():
+            consecutive_tool_only += 1
+        else:
+            consecutive_tool_only = 0
+        if consecutive_tool_only >= 5:
+            messages.append(HumanMessage(content=(
+                "请停止调用工具，基于已获得的工具结果直接给出你的文字建模方案。"
+            )))
+            consecutive_tool_only = 0
+            logger.warning(f"[{layer_tag}] {agent_tag} 连续 5 次仅工具调用，已注入纯文本提醒")
 
         if not getattr(response, "tool_calls", None):
             content = response.content or ""
@@ -1172,7 +1240,13 @@ def _run_modeler_turn(
             )
 
     # 保底：耗尽迭代仍无纯文本（连续 tool_calls），取最后一条非工具文本
-    return messages, _extract_final_output(messages)
+    fallback = _extract_final_output(messages)
+    if not fallback.strip():
+        fallback = (
+            f"（发言生成失败：模型连续 {max_iterations} 次迭代均未产出文字方案，仅有工具调用。"
+            "请检查模型通道或减少工具依赖。）"
+        )
+    return messages, fallback
 
 
 def _make_modeler_node(

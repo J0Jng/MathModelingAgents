@@ -157,6 +157,9 @@ DEFAULT_CONFIG: dict = {
     "max_revision_rounds": int(_env("max_revision_rounds", "8")),
     "max_debate_rounds": int(_env("max_debate_rounds", "10")),  # DEPRECATED: 请使用 max_modeling_rounds / max_revision_rounds
     "max_impl_retries": int(_env("max_impl_retries", "3")),
+    # 辩论历史滚动窗口：喂给 LLM 的历史发言只保留最近 N 轮（history 字段仍全量累积）。
+    # 减少第 N 轮上下文随轮次线性膨胀；不影响轮数与辩论时长。
+    "debate_history_window": int(_env("debate_history_window", "3")),
 
     # ═══════════════════════════════════════════════
     # 层控制

@@ -121,6 +121,19 @@ class MathModelingGraph:
             output_dir = str(desktop / initial_state.get("output_name", "output"))
         self.config["output_dir"] = output_dir
         setup_incremental(output_dir)
+
+        # ── 附件剥离（详见 docs/input-overflow-and-fallback-hardening-impl-brief.md）──
+        # 题目 md 中的附件表格不进 LLM prompt：正文段覆盖 problem_description，
+        # 附件摘要写入 attachment_summary，全量数据落盘供工具按需读取
+        from mathmodelingagents.problem_loader import extract_attachments
+        _md_text = Path(initial_state["problem_path"]).read_text(encoding="utf-8")
+        _body, _summary = extract_attachments(
+            _md_text, output_dir,
+            source_dir=str(Path(initial_state["problem_path"]).parent),
+        )
+        initial_state["problem_description"] = _body
+        initial_state["attachment_summary"] = _summary
+
         problem_name = Path(initial_state.get("problem_path", "")).stem
 
         # ── 流式执行，逐节点写盘 ──

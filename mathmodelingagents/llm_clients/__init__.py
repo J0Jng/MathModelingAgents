@@ -75,6 +75,20 @@ def is_retryable_error(error: Exception) -> bool:
     return False
 
 
+# 「输入超长」确定性错误的特征子串（不可重试、换 provider 无效——是输入太大，不是通道故障）
+_INPUT_TOO_LONG_SUBSTRINGS = (
+    "input length", "maximum length", "maximum context",
+    "context length", "invalidparameter", "too many tokens",
+    "context window", "exceeds the maximum",
+)
+
+
+def is_input_too_long_error(error: Exception) -> bool:
+    """判断是否为「输入超长」确定性错误（不可重试、换 provider 无效）。"""
+    msg = str(error).lower()
+    return any(ss in msg for ss in _INPUT_TOO_LONG_SUBSTRINGS)
+
+
 def _invoke_with_retry(
     llm,
     messages: list,
@@ -301,12 +315,21 @@ def _build_fallback_steps(config: dict, layer: str, role: str) -> list[tuple[str
     primary_model = get_layer_model(config, layer, role)
     flash_model = config.get("quick_think_llm", "deepseek-v4-flash")
     fallback_base_url = config.get("fallback_base_url")
-    return [
+    steps = [
         (provider, primary_model, None),
         (fallback_provider, primary_model, fallback_base_url),
         (provider, flash_model, None),
         (fallback_provider, flash_model, fallback_base_url),
     ]
+    # 按 (provider, model) 去重（保留首次出现）：primary==flash 时 4 步缩为 2 步，避免白跑两遍
+    deduped: list[tuple[str, str, str | None]] = []
+    seen: set[tuple[str, str]] = set()
+    for step in steps:
+        key = (step[0], step[1])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(step)
+    return deduped
 
 
 def invoke_with_fallback(
@@ -367,6 +390,9 @@ def invoke_with_fallback(
             return result
         except Exception as e:
             last_error = e
+            # 输入超长 = 确定性错误，fail-fast，绝不再烧剩余降级调用
+            if is_input_too_long_error(e):
+                raise RuntimeError(f"[{layer}] {agent_name} 输入超长（超过模型上下文上限），请剥离附件数据/精简输入后重试: {e}") from e
             print(f"  [{layer}] {agent_name} ⚠️ {prov}/{model} unavailable → trying next fallback", flush=True)
             logger.warning(f"[{layer}] {agent_name} step{step_num} ({prov}/{model}) 不可用: {e}")
 
@@ -464,6 +490,9 @@ def invoke_with_tools_with_fallback(
             return response
         except Exception as e:
             last_error = e
+            # 输入超长 = 确定性错误，fail-fast，绝不再烧剩余降级调用
+            if is_input_too_long_error(e):
+                raise RuntimeError(f"[{layer}] {agent_name} 输入超长（超过模型上下文上限），请剥离附件数据/精简输入后重试: {e}") from e
             print(f"  [{layer}] {agent_name} ⚠️ {prov}/{model} unavailable → trying next fallback", flush=True)
             logger.warning(f"[{layer}] {agent_name} step{step_num} ({prov}/{model}) 不可用: {e}")
 
