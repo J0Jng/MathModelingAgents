@@ -57,4 +57,14 @@ def load_layer1_state(output_dir: str) -> dict:
         except (json.JSONDecodeError, OSError, AttributeError) as e:
             logger.warning(f"[recovery] 敏感性决策 json 解析失败，按未决处理: {e}")
 
+    candidates_path = Path(output_dir) / "model_candidates.json"
+    if candidates_path.exists():
+        try:
+            data = json.loads(candidates_path.read_text(encoding="utf-8"))
+            text = str(data.get("text", "") or "").strip()
+            if text:
+                recovered["model_candidates"] = text
+        except (json.JSONDecodeError, OSError, AttributeError) as e:
+            logger.warning(f"[recovery] 候选模型池 json 解析失败，跳过回填: {e}")
+
     return recovered

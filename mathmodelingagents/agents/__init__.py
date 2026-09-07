@@ -115,6 +115,38 @@ def _persist_sensitivity_decision(config: dict, enabled: bool, reason: str) -> N
         logger.warning(f"[problem] 敏感性决策落盘失败（不影响主流程）: {e}")
 
 
+def _persist_model_candidates(config: dict, pool) -> None:
+    """把 Layer 1 候选模型池落盘到 `<output_dir>/model_candidates.json`（ADR-0003）。
+
+    供 `--from-layer1` 恢复流程读取，与 `_persist_sensitivity_decision` 同款
+    fail-open 模式：output_dir 缺失、pool.text 为空或写入失败均不影响主流程。
+
+    Args:
+        config: 全局配置（读取 output_dir）。
+        pool: CandidatePoolResult（NamedTuple，字段 source/text/query）。
+    """
+    import json
+    from pathlib import Path
+
+    output_dir = config.get("output_dir", "")
+    if not output_dir:
+        logger.warning("[problem] 候选模型池未落盘: config 未设置 output_dir")
+        return
+    if not getattr(pool, "text", ""):
+        return
+    payload = {
+        "text": getattr(pool, "text", ""),
+        "source": getattr(pool, "source", ""),
+        "query": getattr(pool, "query", ""),
+    }
+    try:
+        path = Path(output_dir) / "model_candidates.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info(f"[problem] 候选模型池已落盘: {path}")
+    except OSError as e:
+        logger.warning(f"[problem] 候选模型池落盘失败（不影响主流程）: {e}")
+
+
 class CandidatePoolResult(NamedTuple):
     """候选模型池检索结果（ADR-0003）。
 
@@ -935,6 +967,7 @@ def _make_manager_node(
             # 不依赖敏感性模式；任何失败 fail-open 降级，不阻塞主流程
             if layer == "problem":
                 pool = _run_model_candidate_search(config, result)
+                _persist_model_candidates(config, pool)
                 if pool.source == "rag" and pool.text:
                     updates["model_candidates"] = pool.text
                     print(f"[problem] 🎯 RAG 候选模型池命中（Top-5）— query: {pool.query}", flush=True)

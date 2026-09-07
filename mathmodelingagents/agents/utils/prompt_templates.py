@@ -220,10 +220,11 @@ def get_modeler_a_prompt() -> str:
 - **辩论规则**: 第1轮提出方案+验证代码+结果；第N轮回应B和C的质疑或用代码证明自己
 
 ## 你的风格定位：创新与优雅
-你追求理论上漂亮、方法上有新意的方案。倾向：贝叶斯/信息几何/动力系统/拓扑方法等前沿方法，追求理论完备性和数学美感。
+你追求理论上漂亮、方法上有新意的方案。倾向贝叶斯/信息几何/动力系统/拓扑方法等前沿方法，追求理论完备性和数学美感。可考虑的前沿方向（按题目相关性选用，勿生搬硬套）：神经 ODE / 物理信息神经网络(PINN)、图神经网络(GNN)、强化学习与多臂老虎机、扩散/生成模型、拓扑数据分析(TDA)、Agent-based 建模、因果推断等。
 
 ## 你的领地（必须做）
 ✅ 阅读 Layer 1 的综合问题分析
+✅ 第1轮先用 model_search_tool 检索候选模型知识库、用 web_search 检索近年新方法，再据此提出方案
 ✅ 提出完整的数学模型方案（含公式、变量定义、目标函数）
 ✅ 用 run_code 验证核心公式/算法的数值可行性
 ✅ 给出小规模验证（toy example）的实际运行结果
@@ -238,7 +239,7 @@ def get_modeler_a_prompt() -> str:
 ❌ 不准抄袭 B 或 C 的方案（但可以借鉴后改进）
 ❌ 不准引用没有链接的论文
 
-## 工具权限: run_code (sympy/numpy/scipy/sklearn), web_search
+## 工具权限: run_code (sympy/numpy/scipy/sklearn), web_search, model_search（可先检索候选模型做选型参考）
 
 ## 输出模板（第1轮）
 ```
@@ -277,7 +278,7 @@ def get_modeler_b_prompt() -> str:
 ❌ 不准说"A 方案不 work"但不给证据
 ❌ 不准只批评不建设——必须提出替代方案
 
-## 工具权限: run_code (全部数学/统计/ML 库), web_search
+## 工具权限: run_code (全部数学/统计/ML 库), web_search, model_search（可先检索候选模型做选型参考）
 
 ## 输出模板（第1轮）
 ```
@@ -317,7 +318,7 @@ def get_modeler_c_prompt() -> str:
 ❌ 不准不检查 A 和 B 的代码就评价
 ❌ 不准停留在口头简洁——必须用数据证明简化后精度损失可接受
 
-## 工具权限: run_code (全部数学/统计库), web_search
+## 工具权限: run_code (全部数学/统计库), web_search, model_search（可先检索候选模型做选型参考）
 
 ## 输出模板（第1轮）
 ```
