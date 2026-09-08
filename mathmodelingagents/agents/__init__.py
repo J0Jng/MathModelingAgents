@@ -284,6 +284,35 @@ def _extract_final_output(messages: list) -> str:
     return ""
 
 
+def _looks_like_complete_plan(content: str) -> bool:
+    """判定一段模型文字是否已构成完整建模方案（足够长且含章节结构）。
+
+    用于 Modeler 发言循环：当回复仍带 tool_calls、但 content 已写成形时，
+    允许提前以该文字作为本轮发言返回，避免持续工具调用耗尽迭代。
+    """
+    import re
+    text = (content or "").strip()
+    if len(text) < 500:
+        return False
+    sections = re.findall(r"###\s*\d+\.", text)
+    return len(sections) >= 2
+
+
+def _extract_last_substantial_text(messages: list, min_chars: int = 500) -> str:
+    """循环耗尽兜底：反向取最后一条 content 足够长的 AI 消息文字（不排除带 tool_calls 的）。
+
+    与 _extract_final_output 不同，这里接受「带 tool_calls 但 content 非空」的消息，
+    因为 Modeler 常在同一轮既写正文又调用验证工具。
+    """
+    for msg in reversed(messages):
+        if getattr(msg, "type", "") != "ai":
+            continue
+        content = (getattr(msg, "content", "") or "").strip()
+        if len(content) >= min_chars:
+            return content
+    return ""
+
+
 def _sanitize_tool_pairing(messages: list) -> list:
     """清洗消息列表中的孤立 ToolMessage 和未完成的 tool_calls AIMessage。
 
@@ -1194,20 +1223,31 @@ def _run_modeler_turn(
         response = invoke_fn(messages)  # 内含降级链 + 空响应重试
         messages.append(response)
 
-        if getattr(response, "tool_calls", None) and not (response.content or "").strip():
+        content = (getattr(response, "content", "") or "").strip()
+        has_tools = bool(getattr(response, "tool_calls", None))
+
+        if has_tools and not content:
             consecutive_tool_only += 1
         else:
             consecutive_tool_only = 0
-        if consecutive_tool_only >= 5:
+        if consecutive_tool_only >= 8:
             messages.append(HumanMessage(content=(
-                "请停止调用工具，基于已获得的工具结果直接给出你的文字建模方案。"
+                "验证已充分，请立即停止调用工具，基于已获得的工具结果直接输出完整的文字"
+                "建模方案（按你的输出模板）。禁止继续调用工具做额外验证。"
             )))
             consecutive_tool_only = 0
-            logger.warning(f"[{layer_tag}] {agent_tag} 连续 5 次仅工具调用，已注入纯文本提醒")
+            logger.warning(f"[{layer_tag}] {agent_tag} 连续 8 次仅工具调用，已注入停止提醒")
 
-        if not getattr(response, "tool_calls", None):
-            content = response.content or ""
-            return messages, content
+        if not has_tools:
+            return messages, getattr(response, "content", "") or ""
+
+        # 新增：带 tool_calls 但文字方案已成形 → 提前返回，不再执行剩余工具
+        if _looks_like_complete_plan(content):
+            logger.info(
+                f"[{layer_tag}] {agent_tag} 文字方案已成形（{len(content)} 字符），"
+                f"提前结束工具调用"
+            )
+            return messages, getattr(response, "content", "")
 
         for tc in response.tool_calls:
             tool_name = tc.get("name", "")
@@ -1243,8 +1283,10 @@ def _run_modeler_turn(
                 f"{result_str[:120]}..."
             )
 
-    # 保底：耗尽迭代仍无纯文本（连续 tool_calls），取最后一条非工具文本
+    # 保底：耗尽迭代仍无纯文本
     fallback = _extract_final_output(messages)
+    if not fallback.strip():
+        fallback = _extract_last_substantial_text(messages)
     if not fallback.strip():
         fallback = (
             f"（发言生成失败：模型连续 {max_iterations} 次迭代均未产出文字方案，仅有工具调用。"
@@ -1263,7 +1305,7 @@ def _make_modeler_node(
 
     绑定 model_search（模型知识库 RAG）+ web_search + run_code 三个工具，
     使用 modeler 专用循环 _run_modeler_turn：一次发言以纯文本方案为终止条件，
-    调用工具只是辅助验证，max_iterations=10 仅作连续 tool_calls 的保底上限。
+    调用工具只是辅助验证，max_iterations=15 仅作连续 tool_calls 的保底上限。
     输出提取沿用 _extract_final_output；辩论状态更新逻辑与原实现一致。
     """
     from mathmodelingagents.tools import create_langchain_tools
@@ -1298,7 +1340,7 @@ def _make_modeler_node(
                 tools=tools,
                 layer_tag="Layer2",
                 agent_tag=agent_name,
-                max_iterations=10,
+                max_iterations=15,
                 initial_messages=messages,
                 invoke_fn=_invoke_fn,
             )
