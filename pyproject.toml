@@ -46,3 +46,9 @@ dev = [
 
 [project.scripts]
 mathmodeling = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["mathmodelingagents*", "cli*"]
