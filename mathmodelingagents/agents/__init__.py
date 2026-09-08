@@ -558,23 +558,27 @@ def _paper_read_disk(output_dir: str, final_output: str, messages: list) -> str:
     if "SELF_CHECK_PASSED" not in final_output:
         return final_output
     from pathlib import Path as _Path
-    paper_candidates = ["paper.md", "PaperAgent_paper.md", "final_paper.md"]
-    paper_dir = _Path(output_dir)
+    drafts_dir = _Path(output_dir) / "drafts"
     paper_text = ""
-    for fname in paper_candidates:
-        fpath = paper_dir / fname
-        if fpath.is_file():
+    if drafts_dir.is_dir():
+        candidates = sorted(
+            drafts_dir.glob("*.md"),
+            key=lambda fp: fp.stat().st_size,
+            reverse=True,
+        )
+        for fp in candidates:
             try:
-                paper_text = fpath.read_text(encoding="utf-8")
+                txt = fp.read_text(encoding="utf-8")
+            except Exception as e:
+                logger.warning(f"[Layer4] PaperAgent 读取草稿失败 {fp}: {e}")
+                continue
+            if "## 摘要" in txt or "## Abstract" in txt:
+                paper_text = txt
                 logger.info(
-                    f"[Layer4] PaperAgent 从磁盘读取论文: "
-                    f"{fpath.name} ({len(paper_text)} 字符)"
+                    f"[Layer4] PaperAgent 从 drafts 读取论文草稿: "
+                    f"{fp.name} ({len(paper_text)} 字符)"
                 )
                 break
-            except Exception as e:
-                logger.warning(
-                    f"[Layer4] PaperAgent 读取论文文件失败 {fpath}: {e}"
-                )
     if paper_text and len(paper_text) > len(final_output):
         combined = (
             f"{final_output}\n\n"
@@ -587,7 +591,7 @@ def _paper_read_disk(output_dir: str, final_output: str, messages: list) -> str:
         )
         return combined
     logger.info(
-        f"[Layer4] PaperAgent 未找到论文文件，已回退到文本输出"
+        f"[Layer4] PaperAgent 未在 drafts 找到论文草稿，回退文本输出"
     )
     return final_output
 

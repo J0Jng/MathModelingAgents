@@ -682,7 +682,7 @@ def get_paper_agent_prompt() -> str:
 |------|------|
 | `read_file(path)` | 读取任意文件。用于核实 Layer 1/2/3 的原始数据、公式、数字，以及 SolverAgent 磁盘上的实际代码 |
 | `list_dir(path)` | 列出目录内容。用于检查 results/ 目录下的图表文件是否存在 |
-| `write_file(content, path)` | 保存文件。用于保存论文草稿 |
+| `write_file(content, path)` | 保存草稿（自动落入 drafts/ 子目录，文件名可自拟） |
 | `check_url(url)` | 验证参考文献 URL 是否真实可达：`✅ 可达` / `⚠️ 反爬或临时错误` / `❌ 失效`。只把 ✅ 或 ⚠️ 的 URL 写入参考文献，❌ 必须删除或替换 |
 
 **注意：你没有 run_code。** 你无法运行代码，一切公式/数值只能靠 read_file 核实前层产出与磁盘代码的文本。
@@ -805,6 +805,7 @@ def get_paper_agent_prompt() -> str:
 ### Phase 2: 分节撰写（每节 2-4 轮）
 对每一节，执行以下循环：
 6. **写**：撰写该节内容，嵌入图表引用（`![caption](../results/filename.png)`）和 LaTeX 公式
+（草稿统一写入 drafts/ 子目录，框架会自动读取最完整的一份作为最终论文，无需自行合并到根目录。）
 7. **查**：`read_file` 回查前层原始数据与磁盘代码，逐条核实：
    - 数字是否正确？（对比 Layer 3 的 code_results / results.json）
    - 公式是否正确？（对比磁盘代码的实际实现，而非 Layer 2 的"意图"）

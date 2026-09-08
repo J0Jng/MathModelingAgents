@@ -564,6 +564,12 @@ def create_paper_agent_tools(output_dir: str) -> list:
         Use this to read Layer 1/2/3 output files, data files, or your own
         previous drafts to verify numbers, formulas, and facts.
         """
+        p = Path(path).expanduser().resolve()
+        if not p.exists():
+            drafts_dir = Path(output_dir).expanduser().resolve() / "drafts"
+            alt = drafts_dir / Path(path).name
+            if alt.exists():
+                return read_problem_file(str(alt))
         return read_problem_file(path)
 
     @tool
@@ -595,18 +601,19 @@ def create_paper_agent_tools(output_dir: str) -> list:
         content: str,
         path: str,
     ) -> str:
-        """Write content to a file. Parent directories are created as needed.
+        """Write content to a file. All drafts are stored under the drafts/ subdirectory.
 
-        Use this to save the final paper or intermediate drafts.
+        Use this to save the paper draft or intermediate sections.
         """
-        p = Path(path).expanduser().resolve()
-        p.parent.mkdir(parents=True, exist_ok=True)
+        drafts_dir = Path(output_dir).expanduser().resolve() / "drafts"
+        drafts_dir.mkdir(parents=True, exist_ok=True)
+        target = drafts_dir / Path(path).name  # 只取 basename：扁平化 + 防 .. 逃逸
         try:
-            p.write_text(content, encoding="utf-8")
-            logger.info("write_file_tool: wrote %d chars to %s", len(content), p)
-            return f"文件已写入: {p} ({len(content)} 字符)"
+            target.write_text(content, encoding="utf-8")
+            logger.info("write_file_tool: wrote %d chars to %s", len(content), target)
+            return f"文件已写入: {target} ({len(content)} 字符)"
         except Exception as e:
-            logger.exception("write_file_tool failed for %s", p)
+            logger.exception("write_file_tool failed for %s", target)
             return f"[错误] 写入失败: {e}"
 
     @tool

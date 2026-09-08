@@ -296,6 +296,30 @@ def _build_summary(all_outputs: list[dict], state: dict) -> str:
     return "\n".join(lines)
 
 
+def _strip_selfcheck_preamble(raw: str) -> str:
+    """剥离 PaperAgent 自检清单序言，只保留论文正文（兜底 REVISE 耗尽路径）。"""
+    if "## SELF_CHECK_PASSED" in raw:
+        # 取该标记之后的内容，再定位论文正文起点（第一个非空且以 # 开头的行）。
+        # 按行切片，健壮处理「有主标题 # xxx」与「无主标题直接 ## 摘要」两种形态，
+        # 避免用 find 匹配 "# " 误命中 "## 摘要" 导致截断。
+        rest = raw.split("## SELF_CHECK_PASSED", 1)[1]
+        lines = rest.split("\n")
+        for i, ln in enumerate(lines):
+            if ln.strip() and ln.strip().startswith("#"):
+                return "\n".join(lines[i:]).strip()
+        return rest.strip()
+    # 无 SELF_CHECK_PASSED 但以自检清单开头：从论文主标题/摘要起取
+    if ("全稿自审" in raw[:800] or "自审" in raw[:400]) and "## 摘要" in raw:
+        idx = raw.find("## 摘要")
+        # 回退到摘要前最近的 ## 或 # 标题
+        head = raw[:idx]
+        for m in reversed(range(len(head))):
+            if head.startswith("# ", m):
+                return raw[m:].strip()
+        return raw[idx:].strip()
+    return raw
+
+
 def _build_final_paper(state: dict, problem_name: str = "") -> str:
     """从 state 提取并格式化最终论文。
 
@@ -303,6 +327,7 @@ def _build_final_paper(state: dict, problem_name: str = "") -> str:
     若内容疑似审查报告（含 ## 修改项 等），回退使用 visualizations 字段。
     """
     raw = state.get("final_paper", "")
+    raw = _strip_selfcheck_preamble(raw)
     # 防御：若 final_paper 包含审查报告而非论文正文，回退到 visualizations
     if not raw or "## 修改项" in raw or raw.strip().startswith("("):
         raw = state.get("visualizations", "") or raw
