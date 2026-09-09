@@ -21,7 +21,7 @@ def check(ok: bool, label: str) -> None:
     print(f"{'PASS' if ok else 'FAIL'}  {label}")
 
 
-TIELU_MARKER = "## 工具调用收敛铁律"
+TIELU_MARKER = "## 方案提交铁律"
 OUTPUT_MARKER = "## 输出模板"
 
 
@@ -70,7 +70,7 @@ tielu_blocks = {name: extract_tielu(p) for name, p in prompts.items()}
 
 for name, block in tielu_blocks.items():
     check(block.startswith(TIELU_MARKER) and len(block) > len(TIELU_MARKER),
-          f"3a. {name} 含「工具调用收敛铁律」段落")
+          f"3a. {name} 含「方案提交铁律」段落")
 
 first = tielu_blocks["modeler_a"]
 rest = [tielu_blocks["modeler_b"], tielu_blocks["modeler_c"]]
@@ -82,14 +82,14 @@ for name, p in prompts.items():
     i_tielu = p.index(TIELU_MARKER)
     i_out = p.index(OUTPUT_MARKER)
     check(i_quan < i_tielu < i_out,
-          f"4. {name} 顺序: 工具权限 < 工具调用收敛铁律 < 输出模板")
+          f"4. {name} 顺序: 工具权限 < 方案提交铁律 < 输出模板")
 
 # ── 5. 源码阈值断言 ──
 src = (REPO_ROOT / "mathmodelingagents" / "agents" / "__init__.py").read_text(
     encoding="utf-8"
 )
-check("consecutive_tool_only >= 8" in src, "5a. 源码含 consecutive_tool_only >= 8")
-check("consecutive_tool_only >= 5" not in src, "5b. 源码不再含 consecutive_tool_only >= 5")
+check("_extract_plan_text" in src, "5a. 源码含 _extract_plan_text")
+check("consecutive_tool_only" not in src, "5b. 源码不再含 consecutive_tool_only")
 
 # ── 6. 回归: verify_modeler_c_tool_loop.py ──
 reg = subprocess.run(

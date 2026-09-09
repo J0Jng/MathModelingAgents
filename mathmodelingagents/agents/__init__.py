@@ -284,35 +284,6 @@ def _extract_final_output(messages: list) -> str:
     return ""
 
 
-def _looks_like_complete_plan(content: str) -> bool:
-    """判定一段模型文字是否已构成完整建模方案（足够长且含章节结构）。
-
-    用于 Modeler 发言循环：当回复仍带 tool_calls、但 content 已写成形时，
-    允许提前以该文字作为本轮发言返回，避免持续工具调用耗尽迭代。
-    """
-    import re
-    text = (content or "").strip()
-    if len(text) < 500:
-        return False
-    sections = re.findall(r"###\s*\d+\.", text)
-    return len(sections) >= 2
-
-
-def _extract_last_substantial_text(messages: list, min_chars: int = 500) -> str:
-    """循环耗尽兜底：反向取最后一条 content 足够长的 AI 消息文字（不排除带 tool_calls 的）。
-
-    与 _extract_final_output 不同，这里接受「带 tool_calls 但 content 非空」的消息，
-    因为 Modeler 常在同一轮既写正文又调用验证工具。
-    """
-    for msg in reversed(messages):
-        if getattr(msg, "type", "") != "ai":
-            continue
-        content = (getattr(msg, "content", "") or "").strip()
-        if len(content) >= min_chars:
-            return content
-    return ""
-
-
 def _sanitize_tool_pairing(messages: list) -> list:
     """清洗消息列表中的孤立 ToolMessage 和未完成的 tool_calls AIMessage。
 
@@ -453,6 +424,7 @@ def _run_tool_loop(
         logger.info(
             f"[{layer_tag}] {agent_tag} iteration {iteration + 1}/{max_iterations}"
         )
+        print(f"[{layer_tag}] {agent_tag} 第 {iteration + 1}/{max_iterations} 轮", flush=True)
 
         # ── 交给 llm 前清洗（可选；对配对良好的消息为无副作用，仅去掉孤立消息）──
         if sanitize is not None:
@@ -500,6 +472,7 @@ def _run_tool_loop(
                         break
 
                 if tool_fn is not None:
+                    print(f"[{layer_tag}] {agent_tag} 🔧 {tool_name}", flush=True)
                     try:
                         result = tool_fn.invoke(tool_args)
                     except Exception as e:
@@ -530,6 +503,7 @@ def _run_tool_loop(
                     f"[{layer_tag}] {agent_tag} 自检通过 "
                     f"(iteration {iteration + 1})"
                 )
+                print(f"[{layer_tag}] {agent_tag} ✅ 自检通过（第 {iteration + 1} 轮）", flush=True)
                 break
 
             if consecutive_no_tool >= consecutive_no_tool_limit:
@@ -537,6 +511,7 @@ def _run_tool_loop(
                     f"[{layer_tag}] {agent_tag} {consecutive_no_tool} 轮无工具调用，"
                     f"强制中断"
                 )
+                print(f"[{layer_tag}] {agent_tag} ⚠️ {consecutive_no_tool} 轮无工具调用，强制中断", flush=True)
                 break
 
     # ── Extract final text output ──
@@ -1195,6 +1170,20 @@ def create_problem_manager(config: dict) -> Callable[[AgentState], dict[str, Any
 # Layer 2: Modeling (Debate)
 # ═══════════════════════════════════════════════════════════════════
 
+def _extract_plan_text(response) -> str | None:
+    """统一交卷提取：submit_plan 的 plan 参数优先，其次无工具调用时的纯文本。"""
+    for tc in getattr(response, "tool_calls", None) or []:
+        if tc.get("name") == "submit_plan_tool":
+            plan = ((tc.get("args") or {}).get("plan") or "").strip()
+            if plan:
+                return plan
+    if not getattr(response, "tool_calls", None):
+        content = (getattr(response, "content", "") or "").strip()
+        if content:
+            return content
+    return None
+
+
 def _run_modeler_turn(
     *,
     tools: list,
@@ -1206,91 +1195,58 @@ def _run_modeler_turn(
 ) -> tuple[list, str]:
     """运行一轮建模师发言（辩论参与者专用，不复用 Solver 的 _run_tool_loop）。
 
-    语义与 Solver 相反：建模师一轮发言以文字方案为产物，调用工具只是辅助验证。
-    - 返回 tool_calls → 执行工具、喂回结果、继续（允许继续验证/检索）
-    - 返回纯文本（无 tool_calls）→ 本轮发言完成，立即以该文本为 result 返回
-    不再有「连续 N 轮无工具调用 → 强制中断」，也不再反向取最后一条文本。
+    语义与 Solver 相反：建模师一轮发言以文字方案为产物，检索工具只是选型辅助。
+    - 调用 submit_plan_tool（args["plan"] 非空）→ 交卷，立即以 plan 为 result 返回
+    - 返回纯文本（无 tool_calls）→ 退化为交卷，以 content 为 result 返回
+    - 其他工具调用 → 执行工具、喂回结果、继续检索/选型
+    终止语义收敛为一条 _extract_plan_text 判断；耗尽迭代则 _extract_final_output 兜底。
     """
     import json as _json
     from langchain_core.messages import ToolMessage
 
     messages = list(initial_messages)
-    consecutive_tool_only = 0
     for iteration in range(max_iterations):
         logger.info(
             f"[{layer_tag}] {agent_tag} iteration {iteration + 1}/{max_iterations}"
         )
-        response = invoke_fn(messages)  # 内含降级链 + 空响应重试
+        print(f"[{layer_tag}] {agent_tag} 第 {iteration + 1}/{max_iterations} 轮", flush=True)
+        response = invoke_fn(messages)
         messages.append(response)
 
-        content = (getattr(response, "content", "") or "").strip()
-        has_tools = bool(getattr(response, "tool_calls", None))
+        plan = _extract_plan_text(response)
+        if plan:
+            logger.info(f"[{layer_tag}] {agent_tag} 交卷（{len(plan)} 字符）")
+            print(f"[{layer_tag}] {agent_tag} ✅ 交卷（{len(plan)} 字符）", flush=True)
+            return messages, plan
 
-        if has_tools and not content:
-            consecutive_tool_only += 1
-        else:
-            consecutive_tool_only = 0
-        if consecutive_tool_only >= 8:
-            messages.append(HumanMessage(content=(
-                "验证已充分，请立即停止调用工具，基于已获得的工具结果直接输出完整的文字"
-                "建模方案（按你的输出模板）。禁止继续调用工具做额外验证。"
-            )))
-            consecutive_tool_only = 0
-            logger.warning(f"[{layer_tag}] {agent_tag} 连续 8 次仅工具调用，已注入停止提醒")
-
-        if not has_tools:
-            return messages, getattr(response, "content", "") or ""
-
-        # 新增：带 tool_calls 但文字方案已成形 → 提前返回，不再执行剩余工具
-        if _looks_like_complete_plan(content):
-            logger.info(
-                f"[{layer_tag}] {agent_tag} 文字方案已成形（{len(content)} 字符），"
-                f"提前结束工具调用"
-            )
-            return messages, getattr(response, "content", "")
-
-        for tc in response.tool_calls:
+        # 未交卷 → 执行它调用的工具并喂回结果
+        for tc in getattr(response, "tool_calls", None) or []:
             tool_name = tc.get("name", "")
             tool_args = tc.get("args", {})
             tool_id = tc.get("id", "")
-
-            tool_fn = None
-            for t in tools:
-                if t.name == tool_name:
-                    tool_fn = t
-                    break
-
+            tool_fn = next((t for t in tools if t.name == tool_name), None)
             if tool_fn is not None:
+                print(f"[{layer_tag}] {agent_tag} 🔧 {tool_name}", flush=True)
                 try:
                     result = tool_fn.invoke(tool_args)
                 except Exception as e:
                     result = f"[工具执行异常] {tool_name}: {e}"
-                    logger.error(
-                        f"[{layer_tag}] 工具 {tool_name} 执行失败: {e}"
-                    )
+                    logger.error(f"[{layer_tag}] 工具 {tool_name} 执行失败: {e}")
             else:
                 result = f"[未知工具] {tool_name}"
-
             result_str = (
                 _json.dumps(result, ensure_ascii=False)
                 if isinstance(result, dict) else str(result)
             )
-            messages.append(ToolMessage(
-                content=result_str, tool_call_id=tool_id,
-            ))
-            logger.info(
-                f"[{layer_tag}] {agent_tag} 工具 {tool_name}: "
-                f"{result_str[:120]}..."
-            )
-
-    # 保底：耗尽迭代仍无纯文本
+            messages.append(ToolMessage(content=result_str, tool_call_id=tool_id))
+            logger.info(f"[{layer_tag}] {agent_tag} 工具 {tool_name}: {result_str[:120]}...")
+            
+    # 兜底：耗尽迭代仍无交卷
     fallback = _extract_final_output(messages)
     if not fallback.strip():
-        fallback = _extract_last_substantial_text(messages)
-    if not fallback.strip():
         fallback = (
-            f"（发言生成失败：模型连续 {max_iterations} 次迭代均未产出文字方案，仅有工具调用。"
-            "请检查模型通道或减少工具依赖。）"
+            f"（发言生成失败：模型连续 {max_iterations} 次迭代均未提交方案。"
+            "请检查模型通道。）"
         )
     return messages, fallback
 
@@ -1303,10 +1259,10 @@ def _make_modeler_node(
 ) -> Callable[[AgentState], dict[str, Any]]:
     """创建建模师节点（辩论参与者，tool-calling 版，ADR-0003）。
 
-    绑定 model_search（模型知识库 RAG）+ web_search + run_code 三个工具，
-    使用 modeler 专用循环 _run_modeler_turn：一次发言以纯文本方案为终止条件，
-    调用工具只是辅助验证，max_iterations=15 仅作连续 tool_calls 的保底上限。
-    输出提取沿用 _extract_final_output；辩论状态更新逻辑与原实现一致。
+    绑定 model_search（模型知识库 RAG）+ web_search + submit_plan 三个工具，
+    使用 modeler 专用循环 _run_modeler_turn：一次发言以 submit_plan 交卷为终止条件，
+    检索工具只是选型辅助，max_iterations=15 仅作发散调用的保底上限。
+    输出提取沿用 _extract_plan_text；辩论状态更新逻辑与原实现一致。
     """
     from mathmodelingagents.tools import create_langchain_tools
 
@@ -1326,8 +1282,8 @@ def _make_modeler_node(
             HumanMessage(content=user_msg),
         ]
 
-        # ── 绑定工具：model_search + web_search + run_code（临时目录版）──
-        wanted = {"model_search_tool", "web_search_tool", "run_code_tool"}
+        # ── 绑定工具：model_search + web_search + submit_plan（选型提交版）──
+        wanted = {"model_search_tool", "web_search_tool", "submit_plan_tool"}
         tools = [t for t in create_langchain_tools() if t.name in wanted]
 
         def _invoke_fn(msgs):

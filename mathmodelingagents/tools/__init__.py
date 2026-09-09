@@ -126,10 +126,22 @@ def build_preamble(
         "# Snapshot of modules that were loaded before user code runs",
         "_preloaded = set(sys.modules.keys())",
         "_original_import = __import__",
+        "# --- socket 阻断 stub：matplotlib.backend_bases 顶层 import socket，",
+        "# 但 Agg 后端保存 PNG 不经网络。注入 stub 让 import 成功、能力按属性抛错。",
+        "class _BlockedSocketStub:",
+        "    def __getattr__(self, name):",
+        "        raise RuntimeError(f'socket.{name} 在沙盒中被禁用（禁止网络）')",
+        "_preinjected = {'socket', '_socket'}",
+        "sys.modules['socket'] = _BlockedSocketStub()",
+        "sys.modules['_socket'] = _BlockedSocketStub()",
         "def _safe_import(name, *args, **kwargs):",
         "    # Precise safe-submodule allow: urllib.parse is pure parsing (no network),",
         "    # and is imported internally by matplotlib.font_manager (CJK font config).",
         "    if name in _safe_submods:",
+        "        return _original_import(name, *args, **kwargs)",
+        "    # 预注入的阻断 stub（socket）直接放行：matplotlib 加载链需 import socket 成功，",
+        "    # 真实网络能力由 stub 在属性访问时抛错阻断。",
+        "    if name in _preinjected:",
         "        return _original_import(name, *args, **kwargs)",
         "    _root = name.split('.')[0]",
         "    # ALWAYS block risky modules — even if preloaded by the runtime",
@@ -403,6 +415,14 @@ def create_langchain_tools() -> list:
             return f"[检索失败] {e}"
 
     @tool
+    def submit_plan_tool(plan: str) -> str:
+        """提交完整的建模方案文本。调用此工具后本轮发言立即结束。
+
+        参数 plan 必须是按输出模板写好的完整建模方案全文。
+        """
+        return f"方案已提交（{len(plan)} 字符）"
+
+    @tool
     def write_file_tool(
         content: str,
         path: str,
@@ -427,6 +447,7 @@ def create_langchain_tools() -> list:
         run_code_tool,
         web_search_tool,
         model_search_tool,
+        submit_plan_tool,
         write_file_tool,
     ]
 
@@ -453,8 +474,17 @@ def create_coding_agent_tools(output_dir: str) -> list:
             "Install with: pip install langchain-core"
         )
 
-    work_dir = str(Path(output_dir).resolve() / "code")
-    results_dir = str(Path(output_dir).resolve() / "results")
+    out_root = Path(output_dir).expanduser().resolve()
+
+    def _resolve(p: str) -> Path:
+        """相对路径统一相对 output_dir；绝对路径照常。与 run_code 的 cwd=output_dir/code 对齐。"""
+        pp = Path(p).expanduser()
+        if not pp.is_absolute():
+            pp = out_root / pp
+        return pp.resolve()
+
+    work_dir = str(out_root / "code")
+    results_dir = str(out_root / "results")
     Path(work_dir).mkdir(parents=True, exist_ok=True)
     Path(results_dir).mkdir(parents=True, exist_ok=True)
 
@@ -464,8 +494,10 @@ def create_coding_agent_tools(output_dir: str) -> list:
 
         Use this to read data files, Layer 2 model output, or code you've
         previously saved.
+
+        相对路径相对于输出目录（output_dir），绝对路径照常。
         """
-        return read_problem_file(path)
+        return read_problem_file(str(_resolve(path)))
 
     @tool
     def run_code_tool(
@@ -494,8 +526,10 @@ def create_coding_agent_tools(output_dir: str) -> list:
 
         Use this to save final Python scripts, JSON results, or other
         artifacts you want to keep.
+
+        相对路径相对于输出目录（output_dir），绝对路径照常。
         """
-        p = Path(path).expanduser().resolve()
+        p = _resolve(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         try:
             p.write_text(content, encoding="utf-8")
@@ -513,8 +547,10 @@ def create_coding_agent_tools(output_dir: str) -> list:
 
         Use this to check what files exist in the code or results directories
         before reading them or to verify files were created.
+
+        相对路径相对于输出目录（output_dir），默认 "." 即列出输出目录内容，绝对路径照常。
         """
-        p = Path(path).expanduser().resolve()
+        p = _resolve(path)
         if not p.exists():
             return f"[错误] 目录不存在: {p}"
         if not p.is_dir():

@@ -65,38 +65,40 @@ r = subprocess.run(
 check(r.returncode == 0, f"2. import 冒烟成功{'' if r.returncode == 0 else ': ' + r.stderr}")
 
 # ── 3/4/5. 单元 + 集成断言 ──
-from mathmodelingagents.agents import (
-    _looks_like_complete_plan,
-    _extract_last_substantial_text,
-    _run_modeler_turn,
-)
+from mathmodelingagents.agents import _extract_plan_text, _run_modeler_turn
 
-check(_looks_like_complete_plan(_make_complete_plan()) is True,
-      "3a. 完整方案（≥500 字 + ≥2 处 ### N.）→ True")
-check(_looks_like_complete_plan("太短的了不起的方案") is False,
-      "3b. 短文字（<500 字）→ False")
-check(_looks_like_complete_plan(_make_long_no_sections()) is False,
-      "3c. 长文字但无章节标记 → False")
-
-long_msg = AIMessage(content=_make_complete_plan(), tool_calls=[
-    {"name": "run_code", "args": {}, "id": "call_1"},
-])
-short_msg = AIMessage(content="好的。")
-check(_extract_last_substantial_text([long_msg, short_msg]) == long_msg.content,
-      "4a. 带 tool_calls 的 ≥500 字 AI 消息 + 后续短消息 → 返回该长文字")
-check(_extract_last_substantial_text([AIMessage(content="短"), AIMessage(content="也短")]) == "",
-      "4b. 全部消息 content <500 字 → 返回 ''")
-
-calls: list[int] = []
 complete = _make_complete_plan()
+
+# 3. _extract_plan_text：submit_plan 优先 / 纯文本退化 / 两者皆无返回 None
+submit_msg = AIMessage(
+    content="",
+    tool_calls=[{"name": "submit_plan_tool", "args": {"plan": complete}, "id": "call_s"}],
+)
+check(_extract_plan_text(submit_msg) == complete,
+      "3a. submit_plan_tool 携带非空 plan → 返回 plan")
+
+plain_msg = AIMessage(content=complete)
+check(_extract_plan_text(plain_msg) == complete,
+      "4a. 无 tool_calls 且有 content → 返回 content")
+check(_extract_plan_text(AIMessage(content="")) is None,
+      "4b. 无 tool_calls 且 content 空 → 返回 None")
+check(_extract_plan_text(AIMessage(
+    content="",
+    tool_calls=[{"name": "model_search_tool", "args": {"query": "x"}, "id": "call_m"}],
+)) is None,
+      "4c. 非 submit_plan 工具调用且无 content → 返回 None")
+
+# 5. _run_modeler_turn：submit_plan 交卷
+calls: list[int] = []
 
 
 def invoke_fn(messages: list):
     calls.append(1)
     return AIMessage(
-        content=complete,
-        tool_calls=[{"name": "run_code", "args": {"code": "print(1)"}, "id": "call_1"}],
+        content="",
+        tool_calls=[{"name": "submit_plan_tool", "args": {"plan": complete}, "id": "call_s"}],
     )
+
 
 msgs, result = _run_modeler_turn(
     tools=[],
@@ -106,8 +108,8 @@ msgs, result = _run_modeler_turn(
     initial_messages=[],
     invoke_fn=invoke_fn,
 )
-check(result == complete, "5a. 提前退出：result == 完整方案 content")
-check(len(calls) == 1, "5b. 提前退出：invoke_fn 仅被调用 1 次（未执行工具、未耗尽循环）")
+check(result == complete, "5a. submit_plan 交卷：result == plan")
+check(len(calls) == 1, "5b. submit_plan 交卷：invoke_fn 仅被调用 1 次")
 
 # ── 汇总 ──
 failed = [label for ok, label in results if not ok]
