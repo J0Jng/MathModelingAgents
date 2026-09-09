@@ -75,6 +75,7 @@ Layer 1: 问题分析（4 Agent，顺序协作）
 Layer 2: 数学建模（4 Agent，辩论循环）
   ModelerA → ModelerB → ModelerC → ModelingManager ──→ 继续辩论 / 通过
   产出：数学模型定义、公式推导、求解方案
+  （建模师绑定 model_search + web_search + submit_plan：检索选型后以 submit_plan 交卷，本层不做数值验证）
 
 Layer 3: 代码实现（3 Agent，Agentic Tool Calling）
   SolverAgent（有工具，内部循环：写→跑→修→再跑）→ ImplManager → VizAgent
@@ -95,7 +96,7 @@ Layer 5: 敏感性分析（3 Agent，可选）
 
 ### Layer 3 & 4 的核心创新：Agentic Tool Calling
 
-Layer 3 的 CodingAgent 和 Layer 4 的 PaperAgent 不再是单次 LLM 调用，而是
+Layer 3 的 SolverAgent 和 Layer 4 的 PaperAgent 不再是单次 LLM 调用，而是
 **有真实工具的自主循环 Agent**：
 
 ```
@@ -111,7 +112,9 @@ Layer 3 的 CodingAgent 和 Layer 4 的 PaperAgent 不再是单次 LLM 调用，
 
 ┌─ PaperAgent（30 轮 max）───────────────┐
 │  工具: read_file / list_dir /          │
-│        write_file（只读为主）           │
+│        write_file / check_url          │
+│  （草稿统一写入 drafts/，根目录仅保留  │
+│    最终稿 final_paper.md）             │
 │                                        │
 │  写 §1 → read_file 核实数据 → 改        │
 │  → 写 §2 → read_file 核实公式 → 改      │
@@ -188,7 +191,7 @@ Layer 3 的 SolverAgent 可自主调用 `web_search` 查询数据字段含义、
 ```
 
 - **L1/L5**：传统 LLM 节点链（System Prompt → 单次调用 → 输出）
-- **L2 建模师**：Agentic 循环，绑定 `model_search`（模型知识库 RAG）+ `web_search` + `run_code` 工具辅助验证，以纯文本建模方案为一次发言的终止条件（连续 tool_calls 保底上限 10 轮）
+- **L2 建模师**：Agentic 循环，绑定 `model_search`（模型知识库 RAG）+ `web_search` + `submit_plan` 三个工具；以 `submit_plan` 交卷为一次发言的终止条件（`max_iterations=15` 仅作检索类调用的保底上限）。本层不做数值验证——方案中的数值结论一律标注「待 Layer 3 数值验证」
 - **L3 SolverAgent**：有 `run_code` / `read_file` / `write_file` / `list_dir` / `web_search` 工具的 Agentic 循环（写→跑→修，最多 30 轮），VizAgent 负责图表生成（最多 10 轮）
 - **L4 PaperAgent**：有 `read_file` / `list_dir` / `write_file` / `check_url` 工具的 Agentic 循环（逐节写→核实→改，最多 30 轮）
 - **总 Agent 数**：17（L1: 4, L2: 4, L3: 3, L4: 2, L5: 3, 模型解释: 1）
@@ -253,6 +256,9 @@ python main.py problem_2024a.md -s never
 - **子进程和线程**（subprocess, threading）放行（matplotlib 内部需要）
 - **每次 run_code 是独立进程**，变量不跨调用保留。跨调用数据通过 write_file → read_file 传递
 - **单次 run_code 硬上限 300s**（`MAX_RUN_CODE_TIMEOUT`），Agent 传入更大的 timeout 也会被钳制；复杂求解需拆分为多个小执行单元
+- **L3 工具路径作用域**：`create_coding_agent_tools` 的 read_file/write_file/list_dir 相对路径统一 scope 到输出目录（`output_dir`），与 run_code 的 cwd=`output_dir/code` 对齐，规避「写 A 处/跑 B 处/读 C 处」的路径迷路
+- **L4 草稿下沉**：PaperAgent 的 write_file 一律扁平化写入 `output_dir/drafts/`（只取 basename + 防 `..` 逃逸），最终论文定稿为根目录 `final_paper.md`
+- **matplotlib/socket 冲突**：构建沙盒 preamble 时注入 `_BlockedSocketStub` 到 `sys.modules`，让 matplotlib 加载链的顶层 `import socket` 成功、真实网络能力在属性访问时抛 `RuntimeError`——解决图表脚本验证阶段必被 socket 阻断失败的问题
 - **中文字体**：沙盒自动检测 SimHei/Microsoft YaHei，无字体时 Agent 应改用英文标签
 
 ### 验证

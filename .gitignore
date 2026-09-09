@@ -32,6 +32,18 @@ mathmodelingagents/knowledge/models/
 UNRESOLVED.md
 *.html
 
+# 开发测试产物（本地保留，不推送）
+# — 调试探针脚本（build_model_library.py 为正式建库脚本，保留）
+scripts/probe_modeler_tool_calls.py
+scripts/verify_*.py
+# — 实施任务书 / 计划（impl-brief、plans）
+docs/**/*-impl-brief.md
+docs/*-impl-brief.md
+docs/plans/
+# — 开发指令备注
+docs/tool-call-print-simplify-instructions.md
+docs/selfcheck-preamble-fix-impl-brief.md
+
 # OS
 .DS_Store
 Thumbs.db
