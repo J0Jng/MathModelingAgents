@@ -8,8 +8,10 @@
   - "volcengine"          火山方舟 **Coding Plan**（`api/coding/v3`，`VOLCENGINE_API_KEY`）
   - "volcengine-plan"     火山方舟 **Agent Plan**（`api/plan/v3`，`VOLCENGINE_PLAN_API_KEY`）
 
-Timeout 策略（从 config.layer_timeouts 读取，默认 180s）：
-  - 默认 180s，超时抛 OpenAITimeoutError 后走重试/降级链
+Timeout 策略（从 config.layer_timeouts 读取，默认 90s）：
+  - 默认 90s。流式调用（streaming=True）下 read timeout 语义变为「两个流块之间的
+    最大间隔」：正常推理 token 持续回流不会超时，90s 无任何字节才抛
+    OpenAITimeoutError 走重试/降级链；同一通道连续超时 5 次即熔断跳下一步。
 """
 
 import logging
@@ -20,7 +22,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # 默认超时（秒）— 当 config 中未指定时使用
-DEFAULT_TIMEOUT = 180
+DEFAULT_TIMEOUT = 90
 
 # ═══════════════════════════════════════════════
 # LLM 调用重试（从 agents/__init__.py 迁移）
@@ -94,10 +96,22 @@ def _invoke_with_retry(
     messages: list,
     agent_name: str,
     layer: str,
+    *,
+    step_label: str = "",
+    consecutive_timeout_limit: int = 5,
 ) -> str:
-    """带重试的 LLM 调用，指数退避 2s → 4s → 8s。"""
+    """带重试的 LLM 调用，指数退避 2s → 4s → 8s。
+
+    同一步（同一 provider+model）内连续 APITimeoutError 达到 consecutive_timeout_limit
+    次即熔断（提前 break，不再烧满剩余重试），由降级循环跳至下一步；换一步重新计数。
+    """
+    from openai import APITimeoutError
+
+    start_time = _time.perf_counter()
+    step_prefix = f"{step_label} " if step_label else ""
     last_error = None
-    for attempt in range(1, _MAX_RETRIES + 1):
+    timeout_streak = 0
+    for attempt in range(1, max(_MAX_RETRIES, consecutive_timeout_limit) + 1):
         try:
             response = llm.invoke(messages)
             result = response.content
@@ -108,8 +122,10 @@ def _invoke_with_retry(
                 logger.info(f"[{layer}] {agent_name} 第 {attempt} 次尝试成功")
             return result
         except Exception as e:
+            elapsed = _time.perf_counter() - start_time
             last_error = e
             if isinstance(e, EmptyLLMResponseError):
+                timeout_streak = 0
                 if attempt < _MAX_RETRIES:
                     delay = _BACKOFF_BASE ** attempt
                     print(f"  [{layer}] {agent_name} ⚠️ 空响应 ({e.char_count} 字符) retry {attempt}/{_MAX_RETRIES} ({delay:.0f}s backoff)", flush=True)
@@ -117,17 +133,24 @@ def _invoke_with_retry(
                     _time.sleep(delay)
                 else:
                     break
-            elif attempt < _MAX_RETRIES and is_retryable_error(e):
+            elif is_retryable_error(e):
+                if isinstance(e, APITimeoutError):
+                    timeout_streak += 1
+                else:
+                    timeout_streak = 0
+                if timeout_streak >= consecutive_timeout_limit:
+                    print(f"  [{layer}] {agent_name} 🔥 {step_prefix}连续超时 ×{timeout_streak}，熔断该通道，跳至下一步", flush=True)
+                    logger.warning(f"[{layer}] {agent_name} {step_label} 连续超时 ×{timeout_streak}，熔断")
+                    break
+                # 非 timeout 错误（或曾被非 timeout 打断的 streak）仍受 _MAX_RETRIES 上限约束；
+                # 只有「从第 1 次起连续超时」的纯超时场景才可重试至 consecutive_timeout_limit 次。
+                if attempt >= _MAX_RETRIES and timeout_streak < attempt:
+                    break
                 delay = _BACKOFF_BASE ** attempt
-                err_code = ""
-                msg = str(e).lower()
-                if "503" in msg: err_code = "503"
-                elif "502" in msg: err_code = "502"
-                elif "504" in msg: err_code = "504"
-                elif "429" in msg: err_code = "429"
-                print(f"  [{layer}] {agent_name} 🔄 retry {attempt}/{_MAX_RETRIES} ({err_code or 'err'}, {delay:.0f}s backoff)", flush=True)
+                max_attempts = max(_MAX_RETRIES, consecutive_timeout_limit)
+                print(f"  [{layer}] {agent_name} 🔄 {step_prefix}{elapsed:.0f}s 后失败 → retry {attempt}/{max_attempts} ({delay:.0f}s backoff)", flush=True)
                 logger.warning(
-                    f"[{layer}] {agent_name} 第 {attempt}/{_MAX_RETRIES} 次失败（可重试），"
+                    f"[{layer}] {agent_name} 第 {attempt}/{max_attempts} 次失败（可重试），"
                     f"{delay:.0f}s 后重试: {e}"
                 )
                 _time.sleep(delay)
@@ -163,10 +186,11 @@ def create_llm_client(
         base_url: 自定义 API 地址
         temperature: 温度参数
         max_tokens: 最大输出 token
-        request_timeout: HTTP 请求超时（秒），从 config.layer_timeouts 读取
+        request_timeout: HTTP 请求超时（秒），从 config.layer_timeouts 读取。
+            流式调用（streaming=True）下，此为「两个流块之间的最大间隔」而非整次响应上限。
 
     Returns:
-        langchain_openai.ChatOpenAI 实例
+        langchain_openai.ChatOpenAI 实例（streaming=True，分片自动聚合，对上层透明）
     """
     from langchain_openai import ChatOpenAI
 
@@ -217,6 +241,7 @@ def create_llm_client(
         max_tokens=max_tokens,
         request_timeout=request_timeout,
         max_retries=2,
+        streaming=True,
         reasoning_effort=reasoning_effort,
     )
 
@@ -377,13 +402,18 @@ def invoke_with_fallback(
 
     last_error = None
     for step_num, (prov, model, base_url) in enumerate(steps, 1):
+        step_label = f"{prov}/{model} (step {step_num}/{len(steps)})"
         try:
+            print(f"  [{layer}] {agent_name} ⏳ calling {prov}/{model} (step {step_num}/{len(steps)}, timeout={timeout}s)...", flush=True)
             llm = create_llm_client(
                 provider=prov, model=model, base_url=base_url,
                 temperature=temperature, max_tokens=max_tokens,
                 request_timeout=timeout,
             )
-            result = _invoke_with_retry(llm, messages, agent_name, layer)
+            start_time = _time.perf_counter()
+            result = _invoke_with_retry(llm, messages, agent_name, layer, step_label=step_label)
+            elapsed = _time.perf_counter() - start_time
+            print(f"  [{layer}] {agent_name} ✅ {elapsed:.1f}s, {len(result)} chars", flush=True)
             if step_num > 1:
                 result = f"[降级 {prov}/{model}]\n\n{result}"
             logger.info(f"[{layer}] {agent_name} step{step_num} ({prov}/{model}) 成功")
@@ -404,15 +434,26 @@ def _invoke_tools_with_retry(
     messages: list,
     agent_name: str,
     layer: str,
+    *,
+    step_label: str = "",
+    consecutive_timeout_limit: int = 5,
 ) -> Any:
     """带重试的工具调用 invoke，返回 AIMessage（含 tool_calls）。
 
     软失败判定：无 tool_calls 且 content.strip() < _MIN_CONTENT_CHARS（10）→ 视为
     EmptyLLMResponseError，走指数退避重试（2s→4s→8s）。与 _run_tool_loop 现有软失败
     检测对齐（agents/__init__.py），语义一致。
+
+    同一步（同一 provider+model）内连续 APITimeoutError 达到 consecutive_timeout_limit
+    次即熔断跳至下一步；换一步重新计数。
     """
+    from openai import APITimeoutError
+
+    start_time = _time.perf_counter()
+    step_prefix = f"{step_label} " if step_label else ""
     last_error = None
-    for attempt in range(1, _MAX_RETRIES + 1):
+    timeout_streak = 0
+    for attempt in range(1, max(_MAX_RETRIES, consecutive_timeout_limit) + 1):
         try:
             response = llm_with_tools.invoke(messages)
             content = getattr(response, "content", "") or ""
@@ -422,8 +463,10 @@ def _invoke_tools_with_retry(
                 logger.info(f"[{layer}] {agent_name} 第 {attempt} 次尝试成功（工具调用）")
             return response
         except Exception as e:
+            elapsed = _time.perf_counter() - start_time
             last_error = e
             if isinstance(e, EmptyLLMResponseError):
+                timeout_streak = 0
                 if attempt < _MAX_RETRIES:
                     delay = _BACKOFF_BASE ** attempt
                     logger.warning(
@@ -433,10 +476,24 @@ def _invoke_tools_with_retry(
                     _time.sleep(delay)
                 else:
                     break
-            elif attempt < _MAX_RETRIES and is_retryable_error(e):
+            elif is_retryable_error(e):
+                if isinstance(e, APITimeoutError):
+                    timeout_streak += 1
+                else:
+                    timeout_streak = 0
+                if timeout_streak >= consecutive_timeout_limit:
+                    print(f"  [{layer}] {agent_name} 🔥 {step_prefix}连续超时 ×{timeout_streak}，熔断该通道，跳至下一步", flush=True)
+                    logger.warning(f"[{layer}] {agent_name} {step_label} 连续超时 ×{timeout_streak}，熔断")
+                    break
+                # 非 timeout 错误（或曾被非 timeout 打断的 streak）仍受 _MAX_RETRIES 上限约束；
+                # 只有「从第 1 次起连续超时」的纯超时场景才可重试至 consecutive_timeout_limit 次。
+                if attempt >= _MAX_RETRIES and timeout_streak < attempt:
+                    break
                 delay = _BACKOFF_BASE ** attempt
+                max_attempts = max(_MAX_RETRIES, consecutive_timeout_limit)
+                print(f"  [{layer}] {agent_name} 🔄 {step_prefix}{elapsed:.0f}s 后失败 → retry {attempt}/{max_attempts} ({delay:.0f}s backoff)", flush=True)
                 logger.warning(
-                    f"[{layer}] {agent_name} 工具调用第 {attempt}/{_MAX_RETRIES} 次失败（可重试），"
+                    f"[{layer}] {agent_name} 工具调用第 {attempt}/{max_attempts} 次失败（可重试），"
                     f"{delay:.0f}s 后重试: {e}"
                 )
                 _time.sleep(delay)
@@ -475,14 +532,20 @@ def invoke_with_tools_with_fallback(
 
     last_error = None
     for step_num, (prov, model, base_url) in enumerate(steps, 1):
+        step_label = f"{prov}/{model} (step {step_num}/{len(steps)})"
         try:
+            print(f"  [{layer}] {agent_name} ⏳ calling {prov}/{model} (step {step_num}/{len(steps)}, timeout={timeout}s)...", flush=True)
             llm = create_llm_client(
                 provider=prov, model=model, base_url=base_url,
                 temperature=temperature, max_tokens=max_tokens,
                 request_timeout=timeout,
             )
             llm_with_tools = llm.bind_tools(tools)
-            response = _invoke_tools_with_retry(llm_with_tools, messages, agent_name, layer)
+            start_time = _time.perf_counter()
+            response = _invoke_tools_with_retry(llm_with_tools, messages, agent_name, layer, step_label=step_label)
+            elapsed = _time.perf_counter() - start_time
+            n_tool_calls = len(getattr(response, "tool_calls", None) or [])
+            print(f"  [{layer}] {agent_name} ✅ {elapsed:.1f}s, {n_tool_calls} tool_calls", flush=True)
             if step_num > 1:
                 logger.info(f"[{layer}] {agent_name} 降级 {prov}/{model} 成功")
             else:

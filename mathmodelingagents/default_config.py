@@ -124,14 +124,14 @@ DEFAULT_CONFIG: dict = {
     },
 
     # ═══════════════════════════════════════════════
-    # 超时配置（每层，秒）— 不限时间，确保推理模型完整跑完
+    # 超时配置（每层，秒）— 单次 HTTP 请求的流式块间最大间隔
     # ═══════════════════════════════════════════════
     "layer_timeouts": {
-        "problem": int(_env("layer_timeout_problem", "180")),
-        "modeling": int(_env("layer_timeout_modeling", "180")),
-        "implementation": int(_env("layer_timeout_implementation", "180")),
-        "paper": int(_env("layer_timeout_paper", "180")),
-        "sensitivity": int(_env("layer_timeout_sensitivity", "180")),
+        "problem": int(_env("layer_timeout_problem", "90")),
+        "modeling": int(_env("layer_timeout_modeling", "90")),
+        "implementation": int(_env("layer_timeout_implementation", "90")),
+        "paper": int(_env("layer_timeout_paper", "90")),
+        "sensitivity": int(_env("layer_timeout_sensitivity", "90")),
     },
 
     # ═══════════════════════════════════════════════
