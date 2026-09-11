@@ -192,13 +192,11 @@ def _persist_model_candidates(config: dict, pool) -> None:
 class CandidatePoolResult(NamedTuple):
     """候选模型池检索结果（ADR-0003）。
 
-    source 三种语义：
-    - "rag":           真实向量检索命中（search_models 正常返回 Top-5）
-    - "full_library":  fail-open 降级为全量谱系（提炼/检索/向量化任一步异常，
-                       但 load_model_library() 成功）
-    - "empty":         完全失败（连全量谱系都加载失败）
+    source 两种语义：
+    - "rag":   真实向量检索命中（search_models 正常返回 Top-5）
+    - "empty": 检索失败（RAG 检索抛异常），跳过候选池注入
     """
-    source: str   # "rag" | "full_library" | "empty"
+    source: str   # "rag" | "empty"
     text: str     # markdown 候选池文本（写入 state["model_candidates"]）
     query: str    # 检索 query 文本（CLI 显示依据）
 
@@ -210,7 +208,7 @@ def _run_model_candidate_search(config: dict, problem_report: str) -> CandidateP
     （3-8 个纯中文特点标签 + 一两句描述），编码为 query 向量检索模型知识库
     Top-5，格式化为 markdown 候选池文本供 Layer 2 第一轮注入。
 
-    fail-open：提炼/检索/向量化任一步失败 → 降级返回全量谱系（不阻塞主流程）。
+    fail-open：提炼/检索/向量化任一步失败 → 返回 empty（跳过注入，不阻塞主流程）。
 
     Args:
         config: 全局配置。
@@ -219,13 +217,11 @@ def _run_model_candidate_search(config: dict, problem_report: str) -> CandidateP
     Returns:
         CandidatePoolResult(source, text, query)：
         - source="rag"：真实检索命中，text 为 Top-5 markdown 候选池，query 为检索文本；
-        - source="full_library"：降级为全量谱系，text 为 52 条 markdown，query 为空；
-        - source="empty"：连全量谱系都加载失败，text 和 query 均为空。
+        - source="empty"：RAG 检索失败，text 和 query 均为空（调用方跳过注入）。
     """
     from mathmodelingagents.knowledge import (
         build_query,
         format_model_entries,
-        load_model_library,
         search_models,
     )
 
@@ -252,12 +248,8 @@ def _run_model_candidate_search(config: dict, problem_report: str) -> CandidateP
         )
         return CandidatePoolResult("rag", format_model_entries(results), query)
     except Exception as e:
-        logger.warning(f"[problem] 候选模型池检索失败，fail-open 返回全量谱系: {e}")
-        try:
-            return CandidatePoolResult("full_library", format_model_entries(load_model_library()), "")
-        except Exception as e2:
-            logger.warning(f"[problem] 全量谱系加载失败，跳过候选池注入: {e2}")
-            return CandidatePoolResult("empty", "", "")
+        logger.warning(f"[problem] RAG 检索失败，跳过候选池注入: {e}")
+        return CandidatePoolResult("empty", "", "")
 
 
 def _extract_final_output(messages: list) -> str:
@@ -1036,11 +1028,8 @@ def _make_manager_node(
                     updates["model_candidates"] = pool.text
                     print(f"[problem] 🎯 RAG 候选模型池命中（Top-5）— query: {pool.query}", flush=True)
                     print(pool.text, flush=True)
-                elif pool.source == "full_library" and pool.text:
-                    updates["model_candidates"] = pool.text
-                    print("[problem] ⚠️ RAG 检索失败，候选池降级为全量谱系（52 条）", flush=True)
                 else:
-                    print("[problem] ⚠️ 候选模型池生成失败，跳过注入", flush=True)
+                    print("[problem] ⚠️ RAG 检索失败，跳过候选池注入", flush=True)
 
         # 根据层写入特定字段
         if layer == "problem":
