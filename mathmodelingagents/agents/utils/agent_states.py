@@ -51,6 +51,7 @@ class AgentState(TypedDict, total=False):
     sensitivity_enabled: bool       # Layer 1 敏感性决策（ADR-0001）；缺省视为 True（fail-open）
     sensitivity_reason: str         # 敏感性决策理由（随上下文注入 Layer 2/3，为扰动预留参数面）
     model_candidates: str           # Layer 1 候选模型池文本（ADR-0003，RAG 检索 Top-5；注入 Layer 2 第一轮）
+    previous_model_spec: str        # --from-layer1 --diverge 模式：先前运行产出的旧模型方案文本（注入 Layer 2 每轮，禁止重复）
     attachment_summary: str         # Layer 1 附件数据摘要（附件名/行数/示例/落盘路径，供各层按需读取；全量表格不进 prompt）
 
     # ═══ Layer 2 产出 ═══

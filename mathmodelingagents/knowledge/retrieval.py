@@ -3,8 +3,10 @@
 数据流：model_library.json（52 条，只读）→ fastembed 本地编码
 （BAAI/bge-small-zh-v1.5，512 维，不引入 torch）→ 余弦相似度 → Top-K。
 
-fail-open 约定：检索/向量化/模型加载任一步失败都不 raise 出模块边界——
-`search_models` 内部捕获后降级返回全量谱系，由调用方直接注入，不阻塞主流程。
+失败语义（由 search_models 的 strict 参数区分）：
+- strict=False（默认）fail-open：检索/向量化/模型加载任一步失败都不 raise 出模块边界——
+  `search_models` 内部捕获后降级返回全量谱系，由调用方直接注入，不阻塞主流程。
+- strict=True：异常时 re-raise，交由上层（候选池提炼路径）捕获后跳过候选池注入。
 所有异常用 logging 记录，不 print。
 """
 
@@ -128,14 +130,16 @@ def _get_vectors(library: list[dict]) -> np.ndarray:
     return _encode([entry_text(m) for m in library])
 
 
-def search_models(query: str, top_k: int = 5) -> list[dict]:
+def search_models(query: str, top_k: int = 5, *, strict: bool = False) -> list[dict]:
     """按 query 检索 Top-K 候选模型。
 
     query 编码 → 与预计算向量算余弦相似度（均已 L2 归一化，内积即余弦）
     → 返回 top_k 条完整模型条目（name/category/traits/usage）。
 
-    fail-open：模型未下载 / 向量化失败 / 缓存损坏等任何异常 →
-    返回全量谱系（调用方注入完整清单，不阻塞主流程）。
+    strict 参数区分两种失败语义：
+    - strict=False（默认）fail-open：模型未下载 / 向量化失败 / 缓存损坏等任何异常 →
+      返回全量谱系（调用方注入完整清单，不阻塞主流程）。
+    - strict=True：任何异常 re-raise（不降级），交由上层捕获后跳过候选池注入。
     """
     library = load_model_library()
     try:
@@ -150,6 +154,9 @@ def search_models(query: str, top_k: int = 5) -> list[dict]:
         )
         return results
     except Exception as e:
+        if strict:
+            logger.warning("模型检索失败（strict），交由上层跳过注入: %s", e)
+            raise
         logger.warning("模型检索失败，fail-open 返回全量谱系: %s", e)
         return library
 

@@ -193,7 +193,7 @@ class CandidatePoolResult(NamedTuple):
     """候选模型池检索结果（ADR-0003）。
 
     source 两种语义：
-    - "rag":   真实向量检索命中（search_models 正常返回 Top-5）
+    - "rag":   真实向量检索命中（search_models strict 模式真实命中 Top-5）
     - "empty": 检索失败（RAG 检索抛异常），跳过候选池注入
     """
     source: str   # "rag" | "empty"
@@ -208,7 +208,7 @@ def _run_model_candidate_search(config: dict, problem_report: str) -> CandidateP
     （3-8 个纯中文特点标签 + 一两句描述），编码为 query 向量检索模型知识库
     Top-5，格式化为 markdown 候选池文本供 Layer 2 第一轮注入。
 
-    fail-open：提炼/检索/向量化任一步失败 → 返回 empty（跳过注入，不阻塞主流程）。
+    fail-open：提炼失败 / 检索失败（strict 模式）→ 返回 empty（跳过注入，不阻塞主流程）。
 
     Args:
         config: 全局配置。
@@ -241,7 +241,7 @@ def _run_model_candidate_search(config: dict, problem_report: str) -> CandidateP
         text = invoke_with_fallback(config, "problem", "manager", messages, "model_candidate_search", max_tokens=512)
         traits, description = _parse_traits_json(text)
         query = build_query(traits, description)
-        results = search_models(query, top_k=5)
+        results = search_models(query, top_k=5, strict=True)
         logger.info(
             "[problem] 候选模型池检索完成: traits=%s, top1=%s",
             traits[:8], results[0].get("name", "") if results else "",
@@ -771,6 +771,16 @@ def _build_context(state: AgentState, layer: str, agent: str, config: dict) -> s
         debate = state.get("model_debate_state", {})
         if candidates and debate.get("round_count", 0) <= 1:
             parts.append(f"## 候选模型池（参考起点，可超越）\n\n{candidates}")
+        # ── 已废弃方案（--from-layer1 --diverge）：每轮注入，强约束禁止重复旧路线 ──
+        previous_spec = state.get("previous_model_spec", "")
+        if previous_spec:
+            parts.append(
+                "## ⛔ 已废弃方案（先前运行产出，本次禁止重复）\n\n"
+                "以下方案已在先前运行中产出并被判定需要更换路线。本次辩论必须提出与它在**建模范式上不同**的方案"
+                "（例如：优化规划 → 改为概率/仿真/启发式/机器学习等完全不同的路线），"
+                "禁止沿用其核心模型结构、目标函数形式或求解方法，仅允许在约束分析层面参考其结论。\n\n"
+                f"{previous_spec}"
+            )
         # ── 滚动窗口：只喂最近 K 轮历史，字段本身仍全量累积（报告依赖全量）──
         window = config.get("debate_history_window", 3)
         if debate.get("a_history"):

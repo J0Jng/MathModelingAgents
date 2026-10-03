@@ -196,6 +196,8 @@ def build_config_from_args(args) -> dict:
     if args.from_layer1:
         config["selected_layers"] = [2, 3]
         config["explain_mode"] = True
+        if args.diverge:
+            config["diverge_mode"] = True
 
     return config
 
@@ -209,6 +211,8 @@ def _mode_label(config: dict) -> str:
     全层显示「完整流程」，单层/部分层用「L1→L2 (层名→层名)」形式。
     """
     if config.get("explain_mode"):
+        if config.get("diverge_mode"):
+            return "发散 (L1 已有 → L2·L3 → 新路线)"
         return "恢复 (L1 已有 → L2·L3 → 解释)"
     selected = [l for l in (config.get("selected_layers") or []) if l in _LAYER_SHORT]
     if not selected or set(selected) == set(_LAYER_SHORT):
@@ -226,6 +230,8 @@ def main():
     )
     parser.add_argument(
         "problem_path",
+        nargs="?",
+        default=None,
         help="题目 Markdown 文件路径",
     )
     parser.add_argument(
@@ -259,8 +265,21 @@ def main():
         metavar="DIR",
         help="从已完成的 Layer 1 输出目录恢复，只跑 L2→L3(+L5) 并生成模型解释文档",
     )
+    parser.add_argument(
+        "--diverge",
+        action="store_true",
+        help="发散建模模式：复用 Layer 1 分析但强制 Layer 2 换路线（需配合 --from-layer1）",
+    )
 
     args = parser.parse_args()
+
+    # --diverge 校验：必须与 --from-layer1 同时使用（置于位置参数校验之前，
+    # 使 `main.py --diverge` 的报错直接指向 --from-layer1）
+    if args.diverge and not args.from_layer1:
+        parser.error("--diverge 需要与 --from-layer1 同时使用")
+
+    if not args.problem_path:
+        parser.error("the following arguments are required: problem_path")
 
     # 验证输入文件
     problem_path = Path(args.problem_path)
@@ -279,7 +298,7 @@ def main():
     if args.from_layer1:
         from mathmodelingagents.graph.recovery import load_layer1_state
 
-        recovered = load_layer1_state(args.from_layer1)
+        recovered = load_layer1_state(args.from_layer1, diverge=args.diverge)
         # 旧目录可能没有敏感性决策落盘：重新判定一次（内存使用，随流程传递）
         if "sensitivity_enabled" not in recovered:
             from mathmodelingagents.agents import _run_sensitivity_decision
@@ -287,7 +306,7 @@ def main():
             enabled, reason = _run_sensitivity_decision(config, recovered["problem_report"])
             recovered["sensitivity_enabled"] = enabled
             recovered["sensitivity_reason"] = reason
-        output_name = args.output or f"{problem_path.stem}_explain"
+        output_name = args.output or f"{problem_path.stem}_{'diverge' if args.diverge else 'explain'}"
         # 从已有 Layer 1 恢复：让流式层横幅从 L2 开始，不再打印「L1·问题分析 开始」
         recovered["current_layer"] = str(config["selected_layers"][0])
 
