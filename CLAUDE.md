@@ -10,7 +10,7 @@ Multi-agent mathematical modeling framework using LangGraph. 5-layer architectur
 - Layer 5: Sensitivity Analysis (conditional pre-paper layer, 3 agents)
 - Layer 5 enablement: runtime decision by Layer 1 (ProblemManager CONCLUDE → structured `sensitivity_enabled` call), governed by `sensitivity_mode` (auto/always/never). When enabled runs L3 → L5 → L4 so sensitivity results reach the paper (ADR-0001/0002). Requires Layer 3 outputs; skipped when Layer 3 is skipped.
 
-Total: 16 agents (down from 19 — Layers 3 and 4 merged from 3-agent chains; Layer 3 split into Solver+Viz)
+Total: 17 agents (L1:4 / L2:4 / L3:3 / L4:2 / L5:3 / explanation:1; down from 19 — Layers 3 and 4 merged from 3-agent chains; Layer 3 split into Solver+Viz)
 
 ## Layer 3 — SolverAgent + VizAgent + ImplManager
 - **SolverAgent**: Single agent with real tools: run_code, read_file, write_file, list_dir
@@ -22,7 +22,7 @@ Total: 16 agents (down from 19 — Layers 3 and 4 merged from 3-agent chains; La
   - Issues RETRY with specific instructions when problems found
   - On CONCLUDE: clears impl_messages to keep state clean for next layers
 - **VizAgent**: Single agent with same tools, focused on chart generation
-  - Internal loop (max 15 iterations): read results.json → generate PNG charts → verify → self-check
+  - Internal loop (max 10 iterations): read results.json → generate PNG charts → verify → self-check
   - Handles Chinese font auto-detection for chart labels
   - Outputs to clear_impl → next layer
 
@@ -34,7 +34,7 @@ Total: 16 agents (down from 19 — Layers 3 and 4 merged from 3-agent chains; La
 - PaperManager does external review (no tools), issues REVISE with §-level specific feedback
 
 ## Prompt Caching
-- All 16 system prompts are pure static strings (no f-string variable injection)
+- All 17 system prompts are pure static strings (no f-string variable injection)
 - Dynamic values (output_dir, round_count, retry_count, etc.) moved to user messages
 - _build_context() now includes all runtime config in the "当前状态" section
 - Enables LLM API prefix caching for 100% system prompt cache hit rate per agent
@@ -46,7 +46,7 @@ Total: 16 agents (down from 19 — Layers 3 and 4 merged from 3-agent chains; La
 
 ## Key Files
 - `mathmodelingagents/default_config.py` — model routing, max_tokens, temperature config
-- `mathmodelingagents/agents/utils/prompt_templates.py` — all 15 static agent system prompts
+- `mathmodelingagents/agents/utils/prompt_templates.py` — all 17 static agent system prompts
 - `mathmodelingagents/llm_clients/__init__.py` — LLM client factory (OpenCode Go / DeepSeek)
 - `mathmodelingagents/agents/__init__.py` — agent node factory functions (incl. tool-calling loops)
 - `mathmodelingagents/tools/__init__.py` — sandbox code execution + LangChain tool wrappers
@@ -54,7 +54,7 @@ Total: 16 agents (down from 19 — Layers 3 and 4 merged from 3-agent chains; La
 - `mathmodelingagents/graph/setup.py` — StateGraph construction
 
 ## Known Model Issues
-- kimi-k2.7-code: returns empty on long Chinese math prompts → REMOVED from config (2026-07-17)
+- kimi-k2.7-code: returns empty on long Chinese math prompts **via the OpenCode Go backend** → re-enabled as the L3 coder on the volcengine-plan channel (native Volcengine endpoint behaves differently); do not use on opencode
 - qwen3.7-max: returns empty on long Chinese math prompts (modeling scenarios) → OK for paper writing
 - glm-5.2/glm-5.1: returns empty on long Chinese math prompts → DO NOT USE
 - deepseek-v4-flash: works but lower quality for complex reasoning
@@ -63,7 +63,7 @@ Total: 16 agents (down from 19 — Layers 3 and 4 merged from 3-agent chains; La
 ## Config Rules
 - Max_tokens_overrides: agent_name priority > role > default (1024)
 - Temperature_overrides: role > default (0.0)
-- All layers timeout: 10800s (3 hours)
+- All layer HTTP streaming timeouts default 90s (max gap between stream chunks, not total layer duration); 5 consecutive timeouts on the same channel trip a circuit breaker to the next fallback step; over-length input is a deterministic error (fail-fast, no fallback burn)
 - Sensitivity mode: `sensitivity_mode` = auto (default, governed by Layer 1) / always / never; legacy `enable_sensitivity` boolean and `selected_layers` containing 5 map to always with a deprecation warning (see `resolve_sensitivity_mode`)
 - **Unified fallback chain** (`invoke_with_fallback` in `llm_clients/__init__.py`):
   1. Primary provider + role model (e.g. opencode + deepseek-v4-pro)

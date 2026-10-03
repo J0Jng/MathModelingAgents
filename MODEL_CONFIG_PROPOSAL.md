@@ -141,9 +141,9 @@ model = provider_model_aliases[provider].get(model, model)               # 别�
 
 ## 超时配置
 
-所有层的 HTTP 请求超时统一 **180s**（`layer_timeouts`，可通过 `MATHMODELING_LAYER_TIMEOUT_*` 逐层覆盖），超时抛 `OpenAITimeoutError` 后走重试/降级链。
+所有层的 LLM 调用均为**流式**（streaming=True），HTTP 超时默认 **90s**（`layer_timeouts`，可通过 `MATHMODELING_LAYER_TIMEOUT_*` 逐层覆盖）。此超时是「两个流块之间的最大间隔」而非整次响应上限——正常推理 token 持续回流不会超时，90s 无任何字节才抛 `OpenAITimeoutError` 后走重试/降级链；同一通道连续超时 5 次即熔断跳至下一降级步。
 
-> 注意：单 LLM 调用超时 180s，不等同于「每层总时长」；Layer 3 等层内部还有自我迭代循环（写→跑→修），单次 `run_code` 沙盒执行另有独立超时（见 `default_config.code_execution.timeout`，默认 30s）。
+> 注意：单 LLM 调用超时 90s，不等同于「每层总时长」；Layer 3 等层内部还有自我迭代循环（写→跑→修），单次 `run_code` 沙盒执行另有独立超时（见 `default_config.code_execution.timeout`，默认 30s）。
 
 ---
 
@@ -179,7 +179,7 @@ MATHMODELING_DEEP_THINK_LLM=deepseek-v4-pro
 MATHMODELING_SKIP_MODEL_PROMPT=1
 
 # 超时与生成参数
-MATHMODELING_LAYER_TIMEOUT_MODELING=180        # 逐层覆盖，默认全部 180s
+MATHMODELING_LAYER_TIMEOUT_MODELING=90         # 流式块间最大间隔秒数，逐层覆盖，默认全部 90s
 MATHMODELING_DEFAULT_MAX_TOKENS=16384          # 统一输出上限
 
 # 辩论 / 重试 / 层控制

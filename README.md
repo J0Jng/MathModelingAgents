@@ -12,11 +12,17 @@
 题目文件 ──→ [L1: 问题分析] ──→ [L2: 数学建模] ──→ [L3: 代码实现] ──→ [L4: 论文写作] ──→ 完整论文
               顺序流水线          辩论循环             Agentic 循环         Agentic 循环
                                                         (写→跑→修)          (写→查→改)
-                                    (可选) [L5: 敏感性分析]
+                                                             │ (L1 判需敏感性时)
+                                                             ▼
+                                     (可选) [L5: 敏感性分析]（插在 L4 之前，L3→L5→L4）
 ```
 
-另有一种**恢复模式**：从一份已完成的 Layer 1 数据出发，只跑 L2→L3（L1 判需敏感性时再插 L5），
-产出**模型解释文档**（面向团队的技术说明）而非竞赛论文：
+另有一种**恢复模式**（`--from-layer1`）：从一份已完成的 Layer 1 数据出发，只跑 L2→L3
+（L1 判需敏感性时再插 L5），产出**模型解释文档**（面向团队的技术说明）而非竞赛论文。恢复模式有两种变体：
+- **默认解释模式**：产出模型解释文档，输出名 `<题目>_explain`。
+- **`--diverge` 发散模式**：复用 Layer 1 分析，但强制 Layer 2 **换建模路线**——读取旧 Layer 2
+  最终方案为 `previous_model_spec`，注入「⛔ 已废弃方案」强约束（禁止重复旧路线），输出名 `<题目>_diverge`。
+  需与 `--from-layer1` 配合。
 
 ```
 已有 Layer1 数据 ──→ [L2: 数学建模] ──→ [L3: 代码实现] ──→ [模型解释文档]
@@ -144,6 +150,11 @@ Agent 接收 ──→ 静态 System Prompt ──→ LLM 调用 ──→ 输�
 
 每步内部有 3 次指数退避重试（2s → 4s → 8s），覆盖 503、超时、限流等瞬态故障。
 
+所有 LLM 调用均为**流式**（streaming=True），read timeout 是「两个流块之间的最大间隔」
+（默认 90s）而非整次响应上限——正常推理 token 持续回流不会超时，90s 无任何字节才抛超时。
+同一通道**连续超时 5 次即熔断**，直接跳到下一降级步（换一步重新计数）；
+输入超长属确定性错误，fail-fast 直接走降级，不消耗重试次数。
+
 ### Prompt 缓存优化
 
 所有 Agent 的 System Prompt 均为**纯静态字符串**（无变量注入），确保 LLM API 的
@@ -187,7 +198,7 @@ Layer 3 的 SolverAgent 可自主调用 `web_search` 查询数据字段含义、
 ### 架构速览
 
 ```
-5 层流水线: L1 问题分析 → L2 数学建模(辩论) → L3 代码实现(Agentic) → L4 论文写作(Agentic) → L5 敏感性分析(可选)
+5 层流水线: L1 问题分析 → L2 数学建模(辩论) → L3 代码实现(Agentic) → [L5 敏感性分析(可选，插在论文前)] → L4 论文写作(Agentic)
 ```
 
 - **L1/L5**：传统 LLM 节点链（System Prompt → 单次调用 → 输出）
@@ -202,7 +213,7 @@ Layer 3 的 SolverAgent 可自主调用 `web_search` 查询数据字段含义、
 |------|------|-----------|
 | `mathmodelingagents/graph/setup.py` | 图拓扑定义（节点、边、路由） | 修改 Agent 编排流程 |
 | `mathmodelingagents/graph/conditional_logic.py` | 条件路由（辩论继续/结束、重试/通过、恢复模式路由） | 修改裁决逻辑 |
-| `mathmodelingagents/graph/recovery.py` | Layer 1 状态恢复（--from-layer1） | 修改恢复模式 |
+| `mathmodelingagents/graph/recovery.py` | Layer 1 状态恢复（--from-layer1，含 --diverge 发散） | 修改恢复模式 |
 | `mathmodelingagents/agents/__init__.py` | Agent 工厂函数（含 Tool Calling 循环） | 修改 Agent 行为、添加工具 |
 | `mathmodelingagents/agents/utils/prompt_templates.py` | 全部 System Prompt（纯静态，可缓存） | 修改 Agent 指令 |
 | `mathmodelingagents/tools/__init__.py` | 沙盒执行 + LangChain Tool 封装 | 修改/添加工具 |
@@ -218,8 +229,11 @@ Layer 3 的 SolverAgent 可自主调用 `web_search` 查询数据字段含义、
 # 运行完整流程
 python main.py problem_2024a.md
 
-# 从已完成的 Layer 1 输出恢复，只跑 L2→L3(+L5)，产出模型解释文档（调试/迭代推荐）
+# 恢复模式（解释模式）：从已完成的 Layer 1 输出恢复，只跑 L2→L3(+L5)，产出模型解释文档（调试/迭代推荐）
 python main.py problem_2024a.md --from-layer1 <已有Layer1目录>
+
+# 发散模式：复用 Layer 1 分析，强制 Layer 2 换建模路线（需配合 --from-layer1）
+python main.py problem_2024a.md --from-layer1 <已有Layer1目录> --diverge
 
 # 只用 DeepSeek 官方 API
 python main.py problem_2024a.md --provider deepseek
@@ -239,7 +253,7 @@ python main.py problem_2024a.md -s never
 
 1. 找到 `prompt_templates.py` 中对应的 `get_XXX_prompt()` 函数
 2. 所有 prompt 函数是**无参数纯静态字符串**（为了 API 缓存）。不要在 prompt 中注入变量，动态值通过 `_build_context()` 在 user message 中提供
-3. 修改后用 `--max-rounds 1 --provider deepseek` 小规模跑一轮冒烟验证（单元测试套件已移除，见下文「验证」）
+3. 修改后用 `--max-rounds 1 --provider deepseek` 小规模跑一轮冒烟验证（另见下文「验证」的单元测试）
 
 ### 添加新 Agent 的步骤
 
@@ -263,7 +277,13 @@ python main.py problem_2024a.md -s never
 
 ### 验证
 
-单元测试套件（`tests/`）已于 2026-09 移除，当前验证方式：
+单元测试位于 `tests/`，运行：
+
+```bash
+.venv/Scripts/python.exe -m pytest tests/ -v
+```
+
+补充的小规模冒烟命令（快速路径，需 API key）：
 
 ```bash
 # 小规模冒烟：一轮辩论完整流程（最快路径，需 API key）
@@ -296,7 +316,7 @@ Provider 级角色覆盖（`provider_layer_model_overrides`），优先于全局
 | L4 writer | `minimax-m3` | 1M 上下文，长文写作 |
 | 其余角色 | `deepseek-v4-pro` / `deepseek-v4-flash` | 沿用默认矩阵 |
 
-Agent Plan 模型池（11 个）：`ark-code-latest`、`doubao-seed-2.1-turbo`、`doubao-seed-evolving`、`glm-5.3/latest`、`deepseek-v4-pro/flash`、`doubao-seed-2.0-lite/mini`、`minimax-m3`、`kimi-k2.7-code`、`kimi-k3`。
+Agent Plan 模型池（11 个）：`ark-code-latest`、`doubao-seed-2.0-lite`、`doubao-seed-2.0-mini`、`doubao-seed-2.1-turbo`、`deepseek-v4-pro`/`deepseek-v4-flash`、`glm-5.3`/`glm-5.3-flash`、`minimax-m3`、`kimi-k2.7-code`、`kimi-k3`。
 
 ### 火山方舟 Coding Plan 通道（`--provider volcengine`）
 
@@ -351,9 +371,9 @@ export HF_HUB_DISABLE_XET=1
 .venv/Scripts/python.exe scripts/build_model_library.py            # 模型已存在时，仅重建向量库
 ```
 
-**一致性铁律**：更换 embedding 模型后**必须重跑建库脚本重建向量库**，否则检索会因 names/维度不一致而退化为现场计算（模型也不可用时进一步 fail-open 为全量谱系注入）。
+**一致性铁律**：更换 embedding 模型后**必须重跑建库脚本重建向量库**，否则检索会因 names/维度不一致而退化为现场计算。
 
-fail-open 行为：模型未下载 / 向量化失败 / 结构化提炼失败时，候选池自动降级为全量模型谱系注入，不阻塞主流程。
+检索失败语义：模型未下载 / 向量化失败 / 结构化提炼失败时，RAG 检索失败即**跳过候选池注入**（不降级为全量谱系），不阻塞主流程。
 
 ## 配置
 
@@ -365,8 +385,15 @@ fail-open 行为：模型未下载 / 向量化失败 / 结构化提炼失败时�
 | `OPENCODE_GO_API_KEY` | (必填) | OpenCode Go API 密钥（主通道） |
 | `DEEPSEEK_API_KEY` | (必填) | DeepSeek 官方 API 密钥（降级通道） |
 | `VOLCENGINE_PLAN_API_KEY` | (选填) | 火山方舟 Agent Plan 专属密钥（订阅后从控制台换取） |
-| `MATHMODELING_MAX_DEBATE_ROUNDS` | `10` | 建模辩论最大轮数 |
+| `MATHMODELING_MAX_DEBATE_ROUNDS` | `10` | 建模辩论最大轮数（已弃用，推荐用 `MATHMODELING_MAX_MODELING_ROUNDS`） |
 | `MATHMODELING_MAX_IMPL_RETRIES` | `3` | 代码实现最大重试次数 |
+| `MATHMODELING_MAX_MODELING_ROUNDS` | `5` | 建模辩论最大轮数 |
+| `MATHMODELING_MAX_REVISION_ROUNDS` | `8` | 论文/实现修订最大轮数 |
+| `MATHMODELING_DEBATE_HISTORY_WINDOW` | `3` | 喂给 LLM 的辩论历史仅保留最近 N 轮 |
+| `MATHMODELING_LAYER_TIMEOUT_*` | `90` | 各层 LLM 流式调用超时（两个流块间的最大间隔秒数），逐层覆盖：`..._PROBLEM` / `..._MODELING` / `..._IMPLEMENTATION` / `..._PAPER` / `..._SENSITIVITY` |
+| `MATHMODELING_SENSITIVITY_MODE` | `auto` | 敏感性模式：`auto`（L1 决策）/ `always` / `never` |
+| `MATHMODELING_DEEP_THINK_LLM` | `deepseek-v4-pro` | 深度思考模型默认值（仅作默认，不关闭交互） |
+| `MATHMODELING_QUICK_THINK_LLM` | `deepseek-v4-flash` | 快速思考模型默认值（仅作默认，不关闭交互） |
 | `MATHMODELING_DEFAULT_MAX_TOKENS` | `16384` | 单次 LLM 调用最大输出 |
 | `MATHMODELING_SELECTED_LAYERS` | `1,2,3,4` | 要执行的层（调试时可用 `3,4` 跳层） |
 | `MATHMODELING_WEB_SEARCH_PROVIDER` | `auto` | Web 搜索后端：`auto`/`tavily`/`ddgs`/`off` |
@@ -387,13 +414,21 @@ python main.py <题目文件> [选项]
                         裸 -s 等价 always 强制启用，never 强制跳过）
   --max-rounds, -r N    每层最大辩论轮次（默认 10）
   --provider, -p        指定 LLM provider（opencode / deepseek / volcengine / volcengine-plan）
-  --from-layer1 DIR     从已完成的 Layer 1 输出目录恢复，只跑 L2→L3(+L5) 产出模型解释文档
+  --from-layer1 DIR     恢复模式：从已完成的 Layer 1 输出目录恢复，只跑 L2→L3(+L5)
+                        产出模型解释文档（默认解释模式）
+  --diverge             发散建模模式：复用 Layer 1 分析但强制 Layer 2 换建模路线
+                        （读取旧 Layer 2 最终方案，注入「⛔ 已废弃方案」禁止重复约束）；
+                        需与 --from-layer1 配合
+
+输出名:
+  恢复模式：<题目>_explain；发散模式：<题目>_diverge（--output 显式指定时优先）
 
   示例:
     python main.py problem_2024a.md
     python main.py problem_2024a.md -s -o my_solution
     python main.py problem_2024a.md -s never          # 强制跳过敏感性分析
-    python main.py problem_2024a.md --from-layer1 results/problem_2024a   # 恢复模式，产出模型解释文档
+    python main.py problem_2024a.md --from-layer1 results/problem_2024a          # 恢复模式，产出模型解释文档
+    python main.py problem_2024a.md --from-layer1 results/problem_2024a --diverge  # 发散模式，强制换建模路线
 ```
 
 ## 项目结构
@@ -404,6 +439,15 @@ MathModelingAgents/
 ├── cli/
 │   ├── model_catalog.py             # 各 provider 官方静态模型清单（交互菜单数据源）
 │   └── model_picker.py              # 交互式 Quick/Deep 模型选择（questionary）
+├── scripts/
+│   └── build_model_library.py       # 模型知识库向量预计算 + embedding 模型下载
+├── tests/                           # pytest 单元测试
+├── docs/                            # 设计文档与 ADR
+│   ├── adr/                         # ADR-0001/0002/0003（敏感性决策、敏感性前置、模型库 RAG）
+│   └── agents/                      # agent 工程技能约定（issue-tracker / triage / domain）
+├── CONTEXT.md                       # 领域术语表（glossary）
+├── CLAUDE.md                        # 工程约定（给 AI 编码 Agent）
+├── MODEL_CONFIG_PROPOSAL.md         # 四 provider 模型分配说明
 ├── pyproject.toml
 ├── .env.example                     # 配置模板（复制为 .env）
 ├── .gitignore
@@ -413,17 +457,25 @@ MathModelingAgents/
     │
     ├── agents/
     │   ├── __init__.py              # Agent 工厂函数（含 Tool Calling 循环）
+    │   ├── problem/                 # Layer 1 问题分析（decomposer/data_analyst/...）
+    │   ├── modeling/                # Layer 2 数学建模（modeler_* 辩论）
+    │   ├── implementation/          # Layer 3 代码实现（solver/viz）
+    │   ├── paper/                   # Layer 4 论文写作（paper_agent）
+    │   ├── sensitivity/             # Layer 5 敏感性分析
     │   └── utils/
     │       ├── prompt_templates.py  # 全部 System Prompt（静态，可缓存）
     │       └── agent_states.py      # AgentState 类型定义
     │
     ├── knowledge/                   # 模型知识库 RAG（Layer 2 候选模型池）
+    │   ├── __init__.py              # 检索入口（search_models / build_query / ...）
     │   ├── model_library.json       # 52 条数学模型条目
     │   ├── model_library_vectors.npz# 预计算向量库（随 git 提交）
-    │   └── retrieval.py             # 语义检索（bge-small-zh-v1.5, 本地 ONNX）
+    │   ├── retrieval.py             # 语义检索（bge-small-zh-v1.5, 本地 ONNX）
+    │   └── models/                  # embedding 模型缓存目录（gitignore，需自下载）
     │
     ├── llm_clients/
-    │   └── __init__.py              # LLM 客户端 + 统一降级链
+    │   ├── __init__.py              # LLM 客户端 + 统一降级链
+    │   └── factory.py               # LLM 客户端工厂
     │
     ├── tools/
     │   ├── __init__.py              # 沙盒代码执行 + LangChain Tool 封装
@@ -435,7 +487,7 @@ MathModelingAgents/
     │   ├── conditional_logic.py     # 辩论/重试/循环路由
     │   ├── propagation.py           # 初始状态 + 图执行参数
     │   ├── checkpointer.py          # 检查点（可选）
-    │   └── recovery.py              # Layer 1 状态恢复（--from-layer1）
+    │   └── recovery.py              # Layer 1 状态恢复（--from-layer1 / --diverge）
     │
     └── reporting.py                 # 增量写盘 + 最终报告汇总
 ```
